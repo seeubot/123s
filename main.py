@@ -1,159 +1,117 @@
-import re
-import json
-import requests
-from bs4 import BeautifulSoup
-import fastapi
-import uvicorn
-from typing import List, Dict, Optional
-from pydantic import BaseModel
-from fastapi import HTTPException, Query
-from fastapi.middleware.cors import CORSMiddleware
+const axios = require('axios');
 
-class DownloadLink(BaseModel):
-    filename: str
-    size: Optional[str] = None
-    direct_link: str
+// Global configuration
+const TERABOX_API_BASE = 'https://teradl-api.dapuntaratya.com';
 
-class TeraboxScraper:
-    def __init__(self):
-        self.headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        }
-        
-        # List of Terabox downloader sites to try
-        self.downloader_sites = [
-            'https://terabox.servehttp.com/api',
-            'https://teraboxapp.com/s/api',
-            'https://terabox-dl.qtcloud.workers.dev/api',
-        ]
-
-    def extract_terabox_code(self, url):
-        """
-        Extract the Terabox share code from the URL
-        """
-        # Try different URL pattern matches
-        patterns = [
-            r'surl=([a-zA-Z0-9]+)',
-            r'share/init\?surl=([a-zA-Z0-9]+)',
-            r'(1[a-zA-Z0-9]+)'
-        ]
-        
-        for pattern in patterns:
-            match = re.search(pattern, url)
-            if match:
-                return match.group(1)
-        
-        raise ValueError("Could not extract Terabox share code from URL")
-
-    def fetch_download_links(self, terabox_url):
-        """
-        Try multiple downloader APIs to fetch download links
-        """
-        # Extract share code
-        share_code = self.extract_terabox_code(terabox_url)
-        
-        # Try each downloader site
-        for site in self.downloader_sites:
-            try:
-                # Construct API request
-                api_url = f"{site}?link={terabox_url}"
-                
-                # Send request
-                response = requests.get(api_url, headers=self.headers, timeout=10)
-                
-                # Check if request was successful
-                if response.status_code == 200:
-                    # Try to parse JSON response
-                    try:
-                        data = response.json()
-                        
-                        # Different APIs might have different response structures
-                        download_links = []
-                        
-                        # Common parsing approaches
-                        if isinstance(data, list):
-                            # Direct list of links
-                            for item in data:
-                                download_links.append(DownloadLink(
-                                    filename=item.get('filename', 'Unknown'),
-                                    size=item.get('size', 'N/A'),
-                                    direct_link=item.get('download_link', item.get('url', ''))
-                                ))
-                        elif isinstance(data, dict):
-                            # Dictionary with files or download info
-                            files = data.get('files', data.get('list', []))
-                            if files:
-                                for file in files:
-                                    download_links.append(DownloadLink(
-                                        filename=file.get('filename', file.get('name', 'Unknown')),
-                                        size=file.get('size', 'N/A'),
-                                        direct_link=file.get('download_link', file.get('url', ''))
-                                    ))
-                        
-                        # If links found, return them
-                        if download_links:
-                            return download_links
-                    
-                    except json.JSONDecodeError:
-                        # Not a JSON response, continue to next site
-                        continue
-            
-            except requests.RequestException:
-                # Request failed, continue to next site
-                continue
-        
-        # If no links found after trying all sites
-        raise HTTPException(status_code=404, detail="No download links could be found")
-
-# Initialize FastAPI app
-app = FastAPI(
-    title="Terabox Downloader API",
-    description="Multi-site Terabox link extractor",
-    version="1.0.0"
-)
-
-# Add CORS middleware
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"]
-)
-
-# Initialize scraper
-scraper = TeraboxScraper()
-
-@app.get("/download", response_model=List[DownloadLink])
-async def fetch_terabox_links(
-    url: str = Query(..., description="Terabox shared URL")
-):
-    """
-    Fetch download links from Terabox shared URL
+// Middleware to handle CORS
+const cors = (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Credentials', true);
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+    res.setHeader(
+        'Access-Control-Allow-Headers',
+        'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
+    );
     
-    - Tries multiple external APIs
-    - No cookies or login required
-    """
-    try:
-        links = scraper.fetch_download_links(url)
-        return links
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    // Handle preflight requests
+    if (req.method === 'OPTIONS') {
+        res.status(200).end();
+        return;
+    }
+    
+    next();
+};
 
-def main():
-    """
-    Run the API server
-    """
-    uvicorn.run(
-        "terabox_scraper:app", 
-        host="0.0.0.0", 
-        port=8000, 
-        reload=True
-    )
+// Configuration endpoint
+const getConfig = async (req, res) => {
+    try {
+        // You can implement your own logic to determine the mode
+        // For now, defaulting to mode 1
+        res.status(200).json({ mode: 1 });
+    } catch (error) {
+        res.status(500).json({ error: 'Failed to get configuration' });
+    }
+};
 
-if __name__ == "__main__":
-    main()
+// Generate file endpoint
+const generateFile = async (req, res) => {
+    try {
+        // Handle OPTIONS preflight
+        if (req.method === 'OPTIONS') {
+            return res.status(200).end();
+        }
 
-# Requirements:
-# pip install fastapi uvicorn requests beautifulsoup4 pydantic
+        // Only allow POST method
+        if (req.method !== 'POST') {
+            return res.status(405).json({ error: 'Method Not Allowed' });
+        }
+
+        const { url, mode } = req.body;
+
+        // Proxy the request to the original Terabox API
+        const response = await axios.post(`${TERABOX_API_BASE}/generate_file`, {
+            url,
+            mode
+        }, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+
+        res.status(200).json(response.data);
+    } catch (error) {
+        console.error('Error in generate_file:', error);
+        res.status(500).json({ 
+            status: 'error', 
+            message: error.response?.data || 'Failed to generate file list' 
+        });
+    }
+};
+
+// Generate link endpoint
+const generateLink = async (req, res) => {
+    try {
+        // Handle OPTIONS preflight
+        if (req.method === 'OPTIONS') {
+            return res.status(200).end();
+        }
+
+        // Only allow POST method
+        if (req.method !== 'POST') {
+            return res.status(405).json({ error: 'Method Not Allowed' });
+        }
+
+        const params = req.body;
+
+        // Proxy the request to the original Terabox API
+        const response = await axios.post(`${TERABOX_API_BASE}/generate_link`, params, {
+            headers: {
+                'Content-Type': 'application/json'
+            }
+        });
+
+        res.status(200).json(response.data);
+    } catch (error) {
+        console.error('Error in generate_link:', error);
+        res.status(500).json({ 
+            status: 'error', 
+            message: error.response?.data || 'Failed to generate download links' 
+        });
+    }
+};
+
+// Health check endpoint
+const healthCheck = (req, res) => {
+    res.status(200).json({ 
+        status: 'healthy', 
+        message: 'Terabox API Proxy is running' 
+    });
+};
+
+// Export serverless functions
+module.exports = {
+    getConfig,
+    generateFile,
+    generateLink,
+    healthCheck
+};
