@@ -1,0 +1,25 @@
+name: terabox-downloader
+services:
+  - name: terabox-bot
+    type: web
+    ports:
+      - port: 8443
+    dockerfile: Dockerfile
+    env:
+      - name: BOT_TOKEN
+        value: $BOT_TOKEN
+      - name: CHANNEL_USERNAME
+        value: $CHANNEL_USERNAME
+      - name: DUMP_CHANNEL_ID
+        value: $DUMP_CHANNEL_ID
+      - name: MONGO_URI
+        value: $MONGO_URI
+      - name: WEBHOOK_URL
+        value: $WEBHOOK_URL
+      - name: NODE_ENV
+        value: production
+      - name: PORT
+        value: 8443
+    routes:
+      - path: /
+        port: 8443
