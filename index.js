@@ -17,17 +17,29 @@ const PORT = process.env.PORT || 3000;
 const agent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 
 // MongoDB connection
-const client = new MongoClient(MONGO_URI, { useNewUrlParser: true, useUnifiedTopology: true });
+const client = new MongoClient(MONGO_URI, { 
+    useNewUrlParser: true, 
+    useUnifiedTopology: true,
+    serverSelectionTimeoutMS: 5000 // 5 second timeout for server selection
+});
 let usersCollection;
+let dbConnected = false;
 
 // Connect to MongoDB
 async function connectToDatabase() {
+    if (!MONGO_URI) {
+        console.warn("⚠️ No MongoDB URI provided. Running without database.");
+        return;
+    }
+    
     try {
         await client.connect();
         usersCollection = client.db("telegramBot").collection("users");
+        dbConnected = true;
         console.log("📂 Connected to MongoDB");
     } catch (error) {
         console.error("MongoDB connection error:", error);
+        console.warn("⚠️ Running without database connection");
     }
 }
 
@@ -44,6 +56,8 @@ async function isUserMember(userId) {
 
 // Save user to database
 async function saveUser(userId, username) {
+    if (!dbConnected) return;
+    
     try {
         await usersCollection.updateOne(
             { userId }, 
@@ -159,7 +173,7 @@ bot.on("text", async (ctx) => {
         const result = await fetchVideo(videoId);
         
         if (!result.success) {
-            await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id);
+            await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
             return ctx.reply("❌ Failed to fetch video. Please check the link or try again later.");
         }
 
@@ -170,14 +184,14 @@ bot.on("text", async (ctx) => {
         console.log("Download URL found from", result.source, "API");
 
         if (!downloadUrl) {
-            await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id);
+            await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
             return ctx.reply("❌ No download link found.");
         }
 
         // Check if file is too large for Telegram
         const fileSizeMB = (fileSize / (1024 * 1024)).toFixed(2);
         if (fileSize > 50000000) {
-            await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id);
+            await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
             await sendToDumpChannel(`⚠️ Large file requested: ${fileSizeMB}MB\nUser: @${username} (${userId})`);
             return ctx.reply(
                 `🚨 File is too large for Telegram (${fileSizeMB}MB)!\n\n` +
@@ -214,10 +228,10 @@ bot.on("text", async (ctx) => {
             await sendToDumpChannel(`❌ Download failed for user: @${username} (${userId})`);
         }
 
-        await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id);
+        await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
     } catch (error) {
         console.error("Error processing request:", error.message);
-        await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id);
+        await ctx.telegram.deleteMessage(ctx.chat.id, processingMsg.message_id).catch(() => {});
         ctx.reply("❌ Something went wrong. Try again later.");
     }
 });
@@ -230,14 +244,26 @@ const startBot = async () => {
     if (process.env.NODE_ENV === 'production') {
         const WEBHOOK_URL = process.env.WEBHOOK_URL;
         
-        // Set webhook
-        await bot.telegram.setWebhook(WEBHOOK_URL);
-        console.log(`🌐 Bot webhook set to ${WEBHOOK_URL}`);
+        if (!WEBHOOK_URL) {
+            console.error("❌ WEBHOOK_URL is not set in production mode!");
+            process.exit(1);
+        }
         
-        // Start webhook
-        bot.startWebhook('/', null, PORT);
+        // Set webhook
+        try {
+            await bot.telegram.setWebhook(WEBHOOK_URL);
+            console.log(`🌐 Bot webhook set to ${WEBHOOK_URL}`);
+            
+            // Start webhook
+            bot.startWebhook('/', null, PORT);
+            console.log(`🚀 Webhook server running on port ${PORT}`);
+        } catch (error) {
+            console.error("❌ Failed to set webhook:", error);
+            process.exit(1);
+        }
     } else {
         // Start in polling mode for development
+        console.log("🔄 Starting bot in polling mode...");
         bot.launch();
     }
     
@@ -247,13 +273,18 @@ const startBot = async () => {
 // Handle shutdown gracefully
 process.once('SIGINT', () => {
     bot.stop('SIGINT');
-    client.close();
+    if (dbConnected) client.close();
+    console.log("Bot stopped due to SIGINT");
 });
 
 process.once('SIGTERM', () => {
     bot.stop('SIGTERM');
-    client.close();
+    if (dbConnected) client.close();
+    console.log("Bot stopped due to SIGTERM");
 });
 
 // Start the bot
-startBot();
+startBot().catch(error => {
+    console.error("Failed to start bot:", error);
+    process.exit(1);
+});
