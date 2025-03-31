@@ -11,6 +11,14 @@ from pymongo import MongoClient
 import re
 import io
 import json
+from flask import Flask, jsonify
+
+# Create Flask app for health checks
+app = Flask(__name__)
+
+@app.route('/health')
+def health_check():
+    return jsonify({"status": "ok"})
 
 # Configure logging
 logging.basicConfig(
@@ -620,14 +628,26 @@ def main() -> None:
     
     # Start the Bot
     if WEBHOOK_URL:
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
-        )
+        try:
+            logger.info(f"Starting webhook on port {PORT}")
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=BOT_TOKEN,
+                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+            )
+        except RuntimeError as e:
+            logger.error(f"Failed to start webhook: {e}")
+            logger.info("Falling back to polling mode")
+            application.run_polling()
     else:
+        logger.info("Starting bot in polling mode")
         application.run_polling()
 
 if __name__ == "__main__":
+    # Start flask app in a separate thread for health checks
+    import threading
+    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.getenv('FLASK_PORT', 8080)), debug=False)).start()
+    
+    # Start the main bot
     main()
