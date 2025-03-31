@@ -1,25 +1,21 @@
-# Dockerfile
-FROM python:3.9-slim
+FROM node:18-alpine
 
-# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    build-essential \
-    && rm -rf /var/lib/apt/lists/*
+# Copy package.json and package-lock.json
+COPY package*.json ./
 
-# Copy requirements file
-COPY requirements.txt .
+# Install dependencies
+RUN npm ci --only=production
 
-# Install Python dependencies
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy project files
+COPY . .
 
-# Copy the application code
-COPY terabox_scraper.py .
+# Set environment variables
+ENV NODE_ENV=production
 
 # Expose the port the app runs on
-EXPOSE 8000
+EXPOSE 3000
 
-# Run the application
-CMD ["uvicorn", "terabox_scraper:app", "--host", "0.0.0.0", "--port", "8000"]
+# Start the application
+CMD ["npm", "start"]
