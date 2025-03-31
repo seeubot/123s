@@ -3,7 +3,6 @@ import logging
 import time
 import asyncio
 from dotenv import load_dotenv
-import http.client
 import requests
 from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
@@ -11,11 +10,7 @@ from telegram.error import NetworkError, TelegramError
 from pymongo import MongoClient
 import re
 import io
-from urllib.parse import urlparse
 import json
-import threading
-import signal
-import sys
 
 # Configure logging
 logging.basicConfig(
@@ -42,9 +37,6 @@ PORT = int(os.getenv("PORT", 8443))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WELCOME_VIDEO_REPO_URL = os.getenv("WELCOME_VIDEO_REPO_URL", "https://github.com/seeubot/Terabox/blame/main/tera.mp4")
 ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "1352497419").split(","))) if os.getenv("ADMIN_IDS") else []
-
-# Heartbeat settings
-HEARTBEAT_INTERVAL = 300  # 5 minutes
 
 # MongoDB connection
 client = None
@@ -333,39 +325,6 @@ async def broadcast_message(context: ContextTypes.DEFAULT_TYPE, message_text, se
         "failed": fail_count
     }
 
-# Heartbeat function to keep the bot alive
-async def heartbeat(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("💓 Heartbeat check...")
-    
-    # Check DB connection
-    if MONGO_URI and not check_db_connection():
-        logger.warning("⚠️ MongoDB connection lost, attempting to reconnect...")
-        try:
-            global client, users_collection, stats_collection, db_connected
-            client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-            db = client.telegramBot
-            users_collection = db.users
-            stats_collection = db.stats
-            db_connected = check_db_connection()
-            if db_connected:
-                logger.info("📂 Reconnected to MongoDB")
-        except Exception as e:
-            logger.error(f"Failed to reconnect to MongoDB: {e}")
-    
-    # Update heartbeat status
-    if db_connected:
-        try:
-            stats_collection.update_one(
-                {"stat": "heartbeat"},
-                {"$set": {"last_beat": time.time()}},
-                upsert=True
-            )
-        except Exception as e:
-            logger.error(f"Error updating heartbeat: {e}")
-    
-    # Queue the next heartbeat
-    context.job_queue.run_once(heartbeat, HEARTBEAT_INTERVAL)
-
 # Command handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
@@ -510,210 +469,165 @@ async def forward_to_dump(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         await update.message.reply_text("❌ No media found in the replied message")
 
-# New command for system maintenance
-async def maintenance_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this command")
+# Handle all messages
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    # Check if the message has text
+    if not update.message or not update.message.text:
         return
     
-    maintenance_options = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Check DB Connection", callback_data="check_db")],
-        [InlineKeyboardButton("Clear Logs", callback_data="clear_logs")],
-        [InlineKeyboardButton("Restart Bot", callback_data="restart_bot")]
-    ])
-    
-    await update.message.reply_text(
-        "🔧 *Maintenance Options*\n\n" +
-        "Select an action to perform:",
-        parse_mode="Markdown",
-        reply_markup=maintenance_options
-    )
-
-# Handler for maintenance callbacks
-async def maintenance_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    user_id = query.from_user.id
-    
-    if not is_admin(user_id):
-        await query.answer("⛔ You are not authorized to use this command")
-        return
-    
-    await query.answer()
-    
-    if query.data == "check_db":
-        if check_db_connection():
-            await query.edit_message_text("✅ Database connection is active")
-        else:
-            await query.edit_message_text("❌ Database connection is not available")
-    
-    elif query.data == "clear_logs":
-        try:
-            open("bot.log", "w").close()
-            await query.edit_message_text("✅ Log file has been cleared")
-        except Exception as e:
-            await query.edit_message_text(f"❌ Failed to clear logs: {e}")
-    
-    elif query.data == "restart_bot":
-        await query.edit_message_text("🔄 Restarting bot...")
-        # Signal the app to restart
-        os.kill(os.getpid(), signal.SIGTERM)
-
-# Handler for terabox links and IDs
-async def handle_terabox(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     username = update.effective_user.username or "Unknown"
-    message_text = update.message.text
     
-    # Save user activity
+    # Save user data
     await save_user(user_id, username)
     
-    # Check if user is a channel member
-    if CHANNEL_USERNAME:
-        is_member = await is_user_member(update, context)
-        if not is_member:
-            await update.message.reply_text(
-                f"❌ Please join our channel {CHANNEL_USERNAME} first to use this bot!",
-                parse_mode="Markdown"
-            )
-            return
-    
-    # Extract ID from the message
-    video_id = extract_terabox_id(message_text)
-    if not video_id:
-        await update.message.reply_text("❌ Invalid TeraBox link or ID. Please send a valid link.")
+    # Check if user is member of the channel
+    if not await is_user_member(update, context):
+        join_button = InlineKeyboardButton("Join Channel", url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}")
+        reply_markup = InlineKeyboardMarkup([[join_button]])
+        await update.message.reply_text(
+            "🔒 You need to join our channel to use this bot.\n" +
+            f"Join: {CHANNEL_USERNAME}\n\n" +
+            "After joining, send your link again.",
+            reply_markup=reply_markup
+        )
         return
     
-    # Log the request
-    logger.info(f"Processing TeraBox request from @{username} ({user_id}): {video_id}")
-    await send_to_dump_channel(context, f"📥 New download request from @{username} ({user_id}): {video_id}")
+    message_text = update.message.text.strip()
+    
+    # Log the received message to dump channel
+    await send_to_dump_channel(context, f"📥 Received from @{username} ({user_id}):\n{message_text}")
+    
+    # Extract TeraBox ID
+    terabox_id = extract_terabox_id(message_text)
+    
+    if not terabox_id:
+        await update.message.reply_text("⚠️ Invalid link format. Please send a valid TeraBox link.")
+        return
     
     # Send processing message
-    processing_msg = await update.message.reply_text("🔄 Processing your request... Please wait!")
+    processing_message = await update.message.reply_text("🔄 Processing your request...")
     
-    # Fetch video info
+    # Fetch video
+    video_result = await fetch_video(terabox_id)
+    
+    if not video_result["success"]:
+        await processing_message.edit_text(
+            "❌ Failed to fetch video.\n\n" +
+            "Possible reasons:\n" +
+            "1. Invalid or expired link\n" +
+            "2. The file may be too large\n" +
+            "3. Our servers might be busy\n\n" +
+            "Please try again later or try a different link."
+        )
+        await log_activity("video_fetch", success=False)
+        return
+    
+    video_data = video_result["data"]
+    
+    if not video_data or not video_data.get("dirName") or not video_data.get("list"):
+        await processing_message.edit_text("❌ Invalid video data received.")
+        await log_activity("video_fetch", success=False)
+        return
+    
     try:
-        video_result = await fetch_video(video_id)
+        # Get file details
+        file_list = video_data.get("list", [])
+        if not file_list:
+            await processing_message.edit_text("❌ No files found in this link.")
+            return
         
-        if video_result["success"]:
-            data = video_result["data"]
+        # Process each file
+        for file_info in file_list:
+            file_name = file_info.get("name", "Unknown")
+            file_size = file_info.get("size", 0)
+            file_size_mb = file_size / (1024 * 1024)  # Convert to MB
             
-            # Check if the response contains direct download links
-            if data.get("links") and len(data["links"]) > 0:
-                # Create inline keyboard with download links
-                keyboard = []
-                for item in data["links"]:
-                    name = item.get("name", "Download")
-                    url = item.get("url", "")
-                    size = item.get("size", "")
-                    
-                    if url:
-                        size_text = f" ({size})" if size else ""
-                        keyboard.append([InlineKeyboardButton(f"{name}{size_text}", url=url)])
-                
-                # Add share button
-                share_text = "Share this bot"
-                keyboard.append([InlineKeyboardButton(share_text, url=f"https://t.me/share/url?url=https://t.me/{context.bot.username}")])
-                
-                reply_markup = InlineKeyboardMarkup(keyboard)
-                
-                # Send video info
-                file_name = data.get("name", "TeraBox File")
-                file_size = data.get("size", "Unknown size")
-                source = video_result.get("source", "API")
-                
-                await processing_msg.edit_text(
-                    f"✅ *File Found*\n\n"
-                    f"📋 *Name:* `{file_name}`\n"
-                    f"📊 *Size:* `{file_size}`\n\n"
-                    f"🔽 *Select a download option below:*",
-                    parse_mode="Markdown",
-                    reply_markup=reply_markup
-                )
-                
-                await log_activity("download_request", success=True)
+            # Format size for display
+            if file_size_mb > 1024:
+                formatted_size = f"{file_size_mb/1024:.1f} GB"
             else:
-                # No links found
-                await processing_msg.edit_text(
-                    "❌ No download links found for this file. It might be private or deleted."
-                )
-                await log_activity("download_request", success=False)
-        else:
-            # API error
-            error_msg = video_result.get("error", "Unknown error")
-            await processing_msg.edit_text(
-                f"❌ Failed to fetch file: {error_msg}\n\n"
-                f"Please try again later or with a different link."
+                formatted_size = f"{file_size_mb:.1f} MB"
+            
+            # Get download links
+            download_url = file_info.get("url", "")
+            
+            if not download_url:
+                await processing_message.edit_text(f"❌ Download URL not found for {file_name}")
+                continue
+            
+            # Create keyboard with download button
+            keyboard = [
+                [InlineKeyboardButton("⬇️ Download", url=download_url)]
+            ]
+            reply_markup = InlineKeyboardMarkup(keyboard)
+            
+            # Send file info and download link
+            await processing_message.edit_text(
+                f"✅ File Ready\n\n" +
+                f"📁 Name: {file_name}\n" +
+                f"📊 Size: {formatted_size}\n\n" +
+                f"📥 Click the button below to download:",
+                reply_markup=reply_markup
             )
-            await log_activity("download_request", success=False)
+            
+            # Log successful fetch
+            await log_activity("video_fetch", success=True)
+            
+            # Send success message to dump channel
+            await send_to_dump_channel(
+                context, 
+                f"✅ Success for @{username} ({user_id}):\n" +
+                f"File: {file_name}\n" +
+                f"Size: {formatted_size}\n" +
+                f"API Source: {video_result['source']}"
+            )
             
     except Exception as e:
-        logger.error(f"Error processing TeraBox request: {e}")
-        await processing_msg.edit_text(
-            "❌ An error occurred while processing your request. Please try again later."
+        logger.error(f"Error processing video: {e}")
+        await processing_message.edit_text(
+            "❌ An error occurred while processing the video.\n" +
+            "Please try again later."
         )
-        await log_activity("download_request", success=False)
+        await log_activity("video_fetch", success=False)
 
-# Main function to set up and run the bot
-async def main():
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Log the error and send a telegram message to notify the developer."""
+    logger.error(f"Exception while handling an update: {context.error}")
+    
+    # Log to dump channel if available
+    if DUMP_CHANNEL_ID:
+        error_message = f"⚠️ ERROR: {context.error}"
+        await send_to_dump_channel(context, error_message)
+
+# Main function to run the bot
+def main() -> None:
     # Create the Application
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add command handlers
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_command))
-    
-    # Admin commands
     application.add_handler(CommandHandler("stats", stats_command))
     application.add_handler(CommandHandler("broadcast", broadcast_command))
     application.add_handler(CommandHandler("forward", forward_to_dump))
-    application.add_handler(CommandHandler("maintenance", maintenance_command))
     
-    # Callback query handler for maintenance menu
-    application.add_handler(CallbackQueryHandler(maintenance_callback))
+    # Add message handler
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Add message handler for TeraBox links
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_terabox))
+    # Add error handler
+    application.add_error_handler(error_handler)
     
-    # Start the heartbeat
-    application.job_queue.run_once(heartbeat, 5)  # Start first heartbeat after 5 seconds
-    
-    # Log startup
-    logger.info("🚀 Bot is starting...")
-    
-    # Use polling or webhook based on environment
+    # Start the Bot
     if WEBHOOK_URL:
-        logger.info(f"Starting bot with webhook at {WEBHOOK_URL}")
-        await application.bot.set_webhook(url=f"{WEBHOOK_URL}/bot{BOT_TOKEN}")
-        await application.run_webhook(
+        application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
-            webhook_url=WEBHOOK_URL,
-            drop_pending_updates=True
+            url_path=BOT_TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
         )
     else:
-        logger.info("Starting bot with polling")
-        await application.run_polling(drop_pending_updates=True)
+        application.run_polling()
 
-# Set up signal handlers for graceful shutdown
-def signal_handler(sig, frame):
-    logger.info("Received signal to terminate. Shutting down gracefully...")
-    # Close MongoDB connection if active
-    if client:
-        client.close()
-    sys.exit(0)
-
-signal.signal(signal.SIGINT, signal_handler)
-signal.signal(signal.SIGTERM, signal_handler)
-
-# Run the bot
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except Exception as error:
-        logger.critical(f"Fatal error: {error}")
-        # Close MongoDB connection if active
-        if client:
-            client.close()
-        sys.exit(1)
+    main()
