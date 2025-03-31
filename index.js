@@ -17,13 +17,20 @@ const PORT = process.env.PORT || 3000;
 const agent = new https.Agent({ keepAlive: true, maxSockets: 10 });
 
 // MongoDB connection
-const client = new MongoClient(MONGO_URI, { 
-    useNewUrlParser: true, 
-    useUnifiedTopology: true,
-    serverSelectionTimeoutMS: 5000 // 5 second timeout for server selection
-});
+let client;
 let usersCollection;
 let dbConnected = false;
+
+// Only initialize MongoDB client if MONGO_URI is provided
+if (MONGO_URI) {
+    client = new MongoClient(MONGO_URI, { 
+        useNewUrlParser: true, 
+        useUnifiedTopology: true,
+        serverSelectionTimeoutMS: 5000 // 5 second timeout for server selection
+    });
+} else {
+    console.warn("⚠️ No MONGO_URI provided. Database functionality will be disabled.");
+}
 
 // Connect to MongoDB
 async function connectToDatabase() {
@@ -33,10 +40,12 @@ async function connectToDatabase() {
     }
     
     try {
-        await client.connect();
-        usersCollection = client.db("telegramBot").collection("users");
-        dbConnected = true;
-        console.log("📂 Connected to MongoDB");
+        if (client) {
+            await client.connect();
+            usersCollection = client.db("telegramBot").collection("users");
+            dbConnected = true;
+            console.log("📂 Connected to MongoDB");
+        }
     } catch (error) {
         console.error("MongoDB connection error:", error);
         console.warn("⚠️ Running without database connection");
@@ -273,13 +282,13 @@ const startBot = async () => {
 // Handle shutdown gracefully
 process.once('SIGINT', () => {
     bot.stop('SIGINT');
-    if (dbConnected) client.close();
+    if (dbConnected && client) client.close();
     console.log("Bot stopped due to SIGINT");
 });
 
 process.once('SIGTERM', () => {
     bot.stop('SIGTERM');
-    if (dbConnected) client.close();
+    if (dbConnected && client) client.close();
     console.log("Bot stopped due to SIGTERM");
 });
 
