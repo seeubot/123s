@@ -244,14 +244,21 @@ def main():
 
     # Run the bot using webhook in production, or polling in development
     if os.getenv("NODE_ENV") == 'production' and WEBHOOK_URL:
-        application.run_webhook(
-            listen="0.0.0.0",
-            port=PORT,
-            url_path=BOT_TOKEN,
-            webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
-        )
-        logger.info(f"🌐 Bot webhook set to {WEBHOOK_URL}")
-        logger.info(f"🚀 Webhook server running on port {PORT}")
+        # Make sure we have the necessary dependencies for webhooks
+        try:
+            # Use the correct webhook method
+            application.run_webhook(
+                listen="0.0.0.0",
+                port=PORT,
+                url_path=BOT_TOKEN,
+                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
+            )
+            logger.info(f"🌐 Bot webhook set to {WEBHOOK_URL}")
+            logger.info(f"🚀 Webhook server running on port {PORT}")
+        except ImportError:
+            logger.error("Failed to start webhook. Make sure python-telegram-bot[webhooks] is installed.")
+            logger.info("🔄 Falling back to polling mode...")
+            application.run_polling()
     else:
         # Start in polling mode for development
         logger.info("🔄 Starting bot in polling mode...")
