@@ -1,18 +1,30 @@
 {
-  "name": "terabox-download-api",
+  "name": "terabox-downloader-bot",
   "version": "1.0.0",
+  "description": "Telegram bot for downloading TeraBox videos",
   "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "nodemon index.js"
+  },
   "engines": {
     "node": "18.x"
   },
-  "scripts": {
-    "start": "node index.js",
-    "vercel-build": "echo 'Build completed'"
-  },
+  "keywords": [
+    "telegram",
+    "bot",
+    "terabox",
+    "downloader"
+  ],
+  "author": "",
+  "license": "MIT",
   "dependencies": {
-    "express": "^4.x",
-    "axios": "^1.x",
-    "cors": "^2.x",
-    "mongoose": "^7.x"
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
+    "mongodb": "^5.8.1",
+    "telegraf": "^4.15.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.1"
   }
 }
