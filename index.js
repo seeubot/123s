@@ -229,7 +229,6 @@ const startBot = async () => {
     // Start the bot in webhook mode for Koyeb
     if (process.env.NODE_ENV === 'production') {
         const WEBHOOK_URL = process.env.WEBHOOK_URL;
-        const PORT = process.env.PORT || 3000;
         
         // Set webhook
         await bot.telegram.setWebhook(WEBHOOK_URL);
