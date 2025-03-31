@@ -1,25 +1,26 @@
 name: terabox-downloader
 services:
-  - name: terabox-bot
-    type: web
+  - name: web
+    instance_type: nano
+    git:
+      repository: your-github-username/your-repo-name
+      branch: main
     ports:
-      - port: 8443
-    dockerfile: Dockerfile
+      - port: 8080
+        protocol: http
+    healthchecks:
+      path: /health
+      port: 8080
     env:
-      - name: BOT_TOKEN
-        value: $BOT_TOKEN
-      - name: CHANNEL_USERNAME
-        value: $CHANNEL_USERNAME
-      - name: DUMP_CHANNEL_ID
-        value: $DUMP_CHANNEL_ID
-      - name: MONGO_URI
-        value: $MONGO_URI
-      - name: WEBHOOK_URL
-        value: $WEBHOOK_URL
-      - name: NODE_ENV
-        value: production
-      - name: PORT
-        value: 8443
-    routes:
-      - path: /
-        port: 8443
+      - key: BOT_TOKEN
+        value: "$BOT_TOKEN"
+      - key: CHANNEL_USERNAME
+        value: "$CHANNEL_USERNAME"
+      - key: DUMP_CHANNEL_ID
+        value: "$DUMP_CHANNEL_ID"
+      - key: MONGO_URI
+        value: "$MONGO_URI"
+      - key: WEBHOOK_URL
+        value: "$WEBHOOK_URL"
+      - key: ADMIN_IDS
+        value: "$ADMIN_IDS"
