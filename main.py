@@ -242,27 +242,9 @@ def main():
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
-    # Run the bot using webhook in production, or polling in development
-    if os.getenv("NODE_ENV") == 'production' and WEBHOOK_URL:
-        # Make sure we have the necessary dependencies for webhooks
-        try:
-            # Use the correct webhook method
-            application.run_webhook(
-                listen="0.0.0.0",
-                port=PORT,
-                url_path=BOT_TOKEN,
-                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
-            )
-            logger.info(f"🌐 Bot webhook set to {WEBHOOK_URL}")
-            logger.info(f"🚀 Webhook server running on port {PORT}")
-        except ImportError:
-            logger.error("Failed to start webhook. Make sure python-telegram-bot[webhooks] is installed.")
-            logger.info("🔄 Falling back to polling mode...")
-            application.run_polling()
-    else:
-        # Start in polling mode for development
-        logger.info("🔄 Starting bot in polling mode...")
-        application.run_polling()
+    # Always use polling mode to avoid webhook issues
+    logger.info("🔄 Starting bot in polling mode...")
+    application.run_polling()
 
     logger.info("🚀 TeraBox Video Bot is running...")
 
