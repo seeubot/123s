@@ -29,7 +29,7 @@ MONGO_URI = os.getenv("MONGO_URI")
 PORT = int(os.getenv("PORT", 8443))
 WEBHOOK_URL = os.getenv("WEBHOOK_URL")
 WELCOME_VIDEO_REPO_URL = os.getenv("WELCOME_VIDEO_REPO_URL", "https://raw.githubusercontent.com/your-repo/welcome-video.mp4")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "").split(","))) if os.getenv("ADMIN_IDS") else []
+ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "1352497419").split(","))) if os.getenv("ADMIN_IDS") else []
 
 # MongoDB connection
 client = None
