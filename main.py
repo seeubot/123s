@@ -36,8 +36,9 @@ load_dotenv()
 
 # Bot configuration
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-PRIMARY_API_URL = "https://alphaapis.org/terabox/v3/dl?id="
-FALLBACK_API_URL = "https://muddy-flower-20ec.arjunavai273.workers.dev/?id="
+# Updated API endpoints for better compatibility
+PRIMARY_API_URL = "https://api.teraboxdownloader.com/api/get_download_link?url="
+FALLBACK_API_URL = "https://terabox-dl-api.vercel.app/api/get_download_link?url="
 CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@terao2")
 DUMP_CHANNEL_ID = os.getenv("DUMP_CHANNEL_ID")
 MONGO_URI = os.getenv("MONGO_URI")
@@ -206,19 +207,31 @@ async def send_to_dump_channel(context: ContextTypes.DEFAULT_TYPE, content, is_t
     logger.error(f"Failed to send to dump channel after {retries} retries")
     return False
 
-# Function to fetch video from primary or fallback API with retries
+# Updated function to fetch video from primary or fallback API with improved error handling
 async def fetch_video(video_id, max_retries=3):
+    # Construct full URLs if necessary
+    if not video_id.startswith("http"):
+        video_url = f"https://terabox.com/s/{video_id}"
+    else:
+        video_url = video_id
+    
     primary_retries = max_retries
     while primary_retries > 0:
         try:
-            # Try primary API
-            response = requests.get(f"{PRIMARY_API_URL}{video_id}", timeout=15)
+            # Try primary API with full URL
+            response = requests.get(f"{PRIMARY_API_URL}{video_url}", timeout=15)
             response_data = response.json()
             
-            if response_data and response_data.get('success') == True:
-                return {"success": True, "data": response_data.get('data'), "source": "primary"}
+            if response_data:
+                # Check for success in different formats
+                if response_data.get('success') == True or response_data.get('status') == "success":
+                    return {"success": True, "data": response_data.get('data', response_data), "source": "primary"}
             
-            # If API responded but with error, break out to try fallback
+            # If API responded but with error, log it
+            error_msg = response_data.get('error', response_data.get('message', 'Unknown error'))
+            logger.warning(f"Primary API error response: {error_msg}")
+            
+            # Break out to try fallback
             break
         except requests.exceptions.Timeout:
             logger.warning(f"Primary API timeout (retries left: {primary_retries-1})")
@@ -235,13 +248,19 @@ async def fetch_video(video_id, max_retries=3):
     while fallback_retries > 0:
         try:
             # Try fallback API
-            fallback_response = requests.get(f"{FALLBACK_API_URL}{video_id}", timeout=15)
+            fallback_response = requests.get(f"{FALLBACK_API_URL}{video_url}", timeout=15)
             fallback_data = fallback_response.json()
             
-            if fallback_data and fallback_data.get('success') == True:
-                return {"success": True, "data": fallback_data.get('data'), "source": "fallback"}
+            if fallback_data:
+                # Check for success in different formats
+                if fallback_data.get('success') == True or fallback_data.get('status') == "success":
+                    return {"success": True, "data": fallback_data.get('data', fallback_data), "source": "fallback"}
             
-            # If API responded but with error, break out
+            # If API responded but with error, log it
+            error_msg = fallback_data.get('error', fallback_data.get('message', 'Unknown error'))
+            logger.warning(f"Fallback API error response: {error_msg}")
+            
+            # Break out
             break
         except requests.exceptions.Timeout:
             logger.warning(f"Fallback API timeout (retries left: {fallback_retries-1})")
@@ -477,7 +496,7 @@ async def forward_to_dump(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     else:
         await update.message.reply_text("❌ No media found in the replied message")
 
-# Handle all messages
+# Updated handle_message function with improved error handling
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     # Check if the message has text
     if not update.message or not update.message.text:
@@ -519,9 +538,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     # Fetch video
     video_result = await fetch_video(terabox_id)
     
+    # Add debugging
     if not video_result["success"]:
+        error_msg = "❌ Failed to fetch video.\n\n"
+        logger.error(f"API response: {video_result.get('error', 'Unknown error')}")
+        
+        # Log the response to dump channel for debugging
+        if DUMP_CHANNEL_ID:
+            await send_to_dump_channel(context, f"DEBUG - API Response for {terabox_id}: {json.dumps(video_result)}")
+        
         await processing_message.edit_text(
-            "❌ Failed to fetch video.\n\n" +
+            error_msg +
             "Possible reasons:\n" +
             "1. Invalid or expired link\n" +
             "2. The file may be too large\n" +
@@ -533,18 +560,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     video_data = video_result["data"]
     
-    if not video_data or not video_data.get("dirName") or not video_data.get("list"):
-        await processing_message.edit_text("❌ Invalid video data received.")
+    # Improved error handling for video data
+    if not video_data:
+        await processing_message.edit_text("❌ No data received from API.")
         await log_activity("video_fetch", success=False)
+        return
+
+    # Be more flexible with the expected response structure
+    if not isinstance(video_data, dict):
+        await processing_message.edit_text("❌ Invalid response format from API.")
+        await log_activity("video_fetch", success=False)
+        # Log actual response for debugging
+        await send_to_dump_channel(context, f"INVALID FORMAT - {json.dumps(video_data)}")
+        return
+
+    # Check for file list in different possible locations in the response
+    file_list = video_data.get("list", [])
+    if not file_list and "files" in video_data:
+        file_list = video_data.get("files", [])
+    # Check for nested data structure
+    elif not file_list and isinstance(video_data.get("data"), dict):
+        file_list = video_data.get("data", {}).get("list", [])
+    
+    if not file_list:
+        await processing_message.edit_text("❌ No files found in this link.")
+        # Log the actual response structure for debugging
+        await send_to_dump_channel(context, f"NO FILES - Response structure: {json.dumps(video_data)}")
         return
     
     try:
-        # Get file details
-        file_list = video_data.get("list", [])
-        if not file_list:
-            await processing_message.edit_text("❌ No files found in this link.")
-            return
-        
         # Process each file
         for file_info in file_list:
             file_name = file_info.get("name", "Unknown")
@@ -557,10 +601,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             else:
                 formatted_size = f"{file_size_mb:.1f} MB"
             
-            # Get download links
+            # Get download links - check multiple possible locations
             download_url = file_info.get("url", "")
+            if not download_url and "dlink" in file_info:
+                download_url = file_info.get("dlink", "")
+            if not download_url and "download_url" in file_info:
+                download_url = file_info.get("download_url", "")
             
             if not download_url:
+                # Log detailed error for debugging
+                await send_to_dump_channel(context, f"NO URL - File info: {json.dumps(file_info)}")
                 await processing_message.edit_text(f"❌ Download URL not found for {file_name}")
                 continue
             
@@ -593,6 +643,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             
     except Exception as e:
         logger.error(f"Error processing video: {e}")
+        # Log the full exception traceback
+        import traceback
+        tb = traceback.format_exc()
+        await send_to_dump_channel(context, f"ERROR TRACEBACK:\n{tb}")
+        
         await processing_message.edit_text(
             "❌ An error occurred while processing the video.\n" +
             "Please try again later."
