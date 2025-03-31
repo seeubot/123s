@@ -8,7 +8,7 @@ const https = require("https");
 const bot = new Telegraf(process.env.BOT_TOKEN);
 const PRIMARY_API_URL = "https://alphaapis.org/terabox/v3/dl?id=";
 const FALLBACK_API_URL = "https://muddy-flower-20ec.arjunavai273.workers.dev/?id=";
-const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || "@awt_bots";
+const CHANNEL_USERNAME = process.env.CHANNEL_USERNAME || "@terao2";
 const DUMP_CHANNEL_ID = process.env.DUMP_CHANNEL_ID; // Add to .env file
 const MONGO_URI = process.env.MONGO_URI;
 const PORT = process.env.PORT || 3000;
