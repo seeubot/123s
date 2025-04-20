@@ -1,26 +1,29 @@
-name: terabox-downloader
-services:
-  - name: web
-    instance_type: nano
-    git:
-      repository: your-github-username/your-repo-name
-      branch: main
-    ports:
-      - port: 8080
-        protocol: http
-    healthchecks:
-      path: /health
-      port: 8080
-    env:
-      - key: BOT_TOKEN
-        value: "$BOT_TOKEN"
-      - key: CHANNEL_USERNAME
-        value: "$CHANNEL_USERNAME"
-      - key: DUMP_CHANNEL_ID
-        value: "$DUMP_CHANNEL_ID"
-      - key: MONGO_URI
-        value: "$MONGO_URI"
-      - key: WEBHOOK_URL
-        value: "$WEBHOOK_URL"
-      - key: ADMIN_IDS
-        value: "$ADMIN_IDS"
+name: telegram-channel-bot
+service:
+  name: telegram-channel-bot
+  type: web
+  ports:
+    - port: 8080
+      protocol: http
+  env:
+    - name: TELEGRAM_BOT_TOKEN
+      value: "6866329408:AAGDH0KcMlGAo9ZX3D4qzBQiuEcO42FoEyQ"
+    - name: MAIN_CHANNEL
+      value: "terao2"
+    - name: MOVIES_CHANNEL
+      value: "@your_movies_channel" 
+    - name: STUFF_CHANNEL
+      value: "@your_stuff_channel"
+  routes:
+    - path: /
+      public: true
+  scaling:
+    min: 1
+    max: 1
+  image:
+    name: telegram-channel-bot
+    registry: docker
+    dockerfile: Dockerfile
+    build_args:
+      - name: TELEGRAM_BOT_TOKEN
+        value: "6866329408:AAGDH0KcMlGAo9ZX3D4qzBQiuEcO42FoEyQ"
