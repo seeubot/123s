@@ -1,13 +1,17 @@
 import os
-import cv2
 import logging
 import pickle
 import datetime
+import tempfile
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, 
     ContextTypes, filters, ConversationHandler, CallbackQueryHandler
 )
+from PIL import Image  # Using PIL instead of OpenCV
+import requests
+from io import BytesIO
+from moviepy.editor import VideoFileClip  # Alternative to OpenCV for video processing
 
 # Configure logging
 logging.basicConfig(
@@ -22,8 +26,13 @@ CHANNEL_USERNAME = os.environ.get("MAIN_CHANNEL", "terao2")
 MOVIES_CHANNEL = os.environ.get("MOVIES_CHANNEL", "@diskmoviee")
 STUFF_CHANNEL = os.environ.get("STUFF_CHANNEL", "@dailydiskwala")
 
+# Webhook settings for Koyeb deployment
+WEBHOOK_URL = os.environ.get("WEBHOOK_URL", "")  # Set this in Koyeb environment variables
+PORT = int(os.environ.get("PORT", 8080))
+USE_WEBHOOK = os.environ.get("USE_WEBHOOK", "True").lower() == "true"
+
 # Admin user ID - only this user can access the bot
-ADMIN_USER_ID = 1352497419
+ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "1352497419"))
 
 # Debug and Auto-start settings
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "False").lower() == "true"
@@ -169,7 +178,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"and you can choose which channel to post it to.\n\n"
         f"💡 Current settings:\n"
         f"- Debug mode: {'✅ ON' if DEBUG_MODE else '❌ OFF'}\n"
-        f"- Auto-start: {'✅ ON' if AUTO_START else '❌ OFF'}"
+        f"- Auto-start: {'✅ ON' if AUTO_START else '❌ OFF'}\n"
+        f"- Webhook mode: {'✅ ON' if USE_WEBHOOK else '❌ OFF'}"
     )
 
 async def toggle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -191,7 +201,7 @@ async def toggle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         # Print current configuration when debug is enabled
         debug_log(f"Current configuration: TOKEN={TOKEN[:5]}... ADMIN_USER_ID={ADMIN_USER_ID}")
         debug_log(f"Channels: Main={CHANNEL_USERNAME}, Movies={MOVIES_CHANNEL}, Stuff={STUFF_CHANNEL}")
-        debug_log(f"Auto-start: {AUTO_START}")
+        debug_log(f"Auto-start: {AUTO_START}, Webhook: {USE_WEBHOOK}, Port: {PORT}")
 
 async def toggle_autostart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Toggle auto-start mode on/off."""
@@ -299,7 +309,9 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"🔐 Admin ID: {ADMIN_USER_ID}\n\n"
         f"🔧 Settings:\n"
         f"- Debug mode: {'✅ ON' if DEBUG_MODE else '❌ OFF'}\n"
-        f"- Auto-start: {'✅ ON' if AUTO_START else '❌ OFF'}\n\n"
+        f"- Auto-start: {'✅ ON' if AUTO_START else '❌ OFF'}\n"
+        f"- Webhook mode: {'✅ ON' if USE_WEBHOOK else '❌ OFF'}\n"
+        f"- Port: {PORT}\n\n"
         f"📊 System:\n"
         f"- Temporary files: {temp_file_count}\n"
         f"- Active sessions: {active_sessions}\n"
@@ -699,21 +711,18 @@ async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     user_data[user_id]['url'] = url
     save_session()
     
-    # Ask for caption
-    await update.message.reply_text(
-        "Thanks! Now, please send me the caption you want to display under the thumbnail."
-    )
+    await update.message.reply_text("Now, please send me the caption for this post.")
     return WAITING_FOR_CAPTION
 
 async def process_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process the caption and ask for channel selection."""
+    """Process the caption provided by the user."""
     # Check if user is admin
     if not await check_admin(update):
         return ConversationHandler.END
     
     user_id = update.effective_user.id
-    caption = update.message.text
-    debug_log(f"Caption received from user {user_id}: {caption[:30]}...")
+    caption = update.message.text.strip()
+    debug_log(f"Caption received from user {user_id}")
     
     if user_id not in user_data:
         debug_log(f"No active session for user {user_id}")
@@ -724,19 +733,18 @@ async def process_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     user_data[user_id]['caption'] = caption
     save_session()
     
-    # Ask for channel selection
+    # Ask which channel to post to
     keyboard = [
-        [
-            InlineKeyboardButton("🎬 MOVIES Channel", callback_data=CALLBACK_MOVIES),
-            InlineKeyboardButton("📦 STUFF Channel", callback_data=CALLBACK_STUFF)
-        ]
+        [InlineKeyboardButton("Movies Channel", callback_data=CALLBACK_MOVIES)],
+        [InlineKeyboardButton("Stuff Channel", callback_data=CALLBACK_STUFF)]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
+
     await update.message.reply_text(
-        "Great! Now please select which channel to post this to:",
+        "Please select which channel to post to:",
         reply_markup=reply_markup
     )
+    
     return WAITING_FOR_CHANNEL_SELECTION
 
 async def select_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -745,7 +753,7 @@ async def select_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
     
     user_id = query.from_user.id
-    debug_log(f"Channel selection callback from user {user_id}: {query.data}")
+    debug_log(f"Channel selection from user {user_id}: {query.data}")
     
     # Check if user is admin
     if user_id != ADMIN_USER_ID:
@@ -758,250 +766,173 @@ async def select_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.edit_message_text("Sorry, there was an error. Please start over by sending a video.")
         return ConversationHandler.END
     
-    # Determine which channel to post to
-    if query.data == CALLBACK_MOVIES:
-        channel = MOVIES_CHANNEL
-        channel_name = "MOVIES"
-    elif query.data == CALLBACK_STUFF:
-        channel = STUFF_CHANNEL
-        channel_name = "STUFF"
-    else:
-        debug_log(f"Invalid channel selection: {query.data}")
-        await query.edit_message_text("Invalid channel selection. Please try again.")
-        return ConversationHandler.END
+    # Get the channel based on callback data
+    channel = MOVIES_CHANNEL if query.data == CALLBACK_MOVIES else STUFF_CHANNEL
+    channel_name = "Movies" if query.data == CALLBACK_MOVIES else "Stuff"
     
-    # Store the channel for this post
+    debug_log(f"Selected channel: {channel}")
     user_data[user_id]['channel'] = channel
-    user_data[user_id]['channel_name'] = channel_name
     save_session()
     
-    debug_log(f"User selected {channel_name} channel")
+    await query.edit_message_text(f"You selected the {channel_name} Channel. Processing your post...")
     
-    # Send confirmation and begin posting process
-    await query.edit_message_text(f"You've selected the {channel_name} channel. Now posting...")
-    
-    # Call the function to post to the channel
-    success = await post_to_channel(user_id, context)
-    
-    if success:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"✅ Successfully posted to {channel_name} channel!"
-        )
-    else:
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=f"❌ Failed to post to {channel_name} channel. Please try again."
-        )
-    
-    # Cleanup and end the conversation
-    cleanup_user_files(user_id)
-    return ConversationHandler.END
-
-async def post_to_channel(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Post the thumbnail with caption and URL to the specified channel."""
-    debug_log(f"Posting to channel for user {user_id}")
-    
-    if user_id not in user_data:
-        debug_log(f"No data found for user {user_id}")
-        return False
-    
+    # Post to the selected channel
     try:
-        # Get the user data
-        channel = user_data[user_id]['channel']
+        # Get all the necessary data
+        thumbnail_path = user_data[user_id]['thumbnail_path']
         url = user_data[user_id]['url']
         caption = user_data[user_id]['caption']
-        thumbnail_path = user_data[user_id]['thumbnail_path']
-        channel_name = user_data[user_id]['channel_name']
         
-        debug_log(f"Posting to {channel_name} channel ({channel})")
+        debug_log(f"Preparing to post to {channel_name} Channel with URL: {url}")
         
-        # Create buttons for the post
-        keyboard = []
-        
-        # Add URL button
-        keyboard.append([InlineKeyboardButton("Download / Watch", url=url)])
-        
-        # Add the join channel button
-        clean_channel = channel.replace("@", "")
-        keyboard.append([InlineKeyboardButton(f"Join Our {channel_name} Channel", url=f"https://t.me/{clean_channel}")])
-        
+        # Create inline keyboard with the URL
+        keyboard = [[InlineKeyboardButton("🔗 Open Link", url=url)]]
         reply_markup = InlineKeyboardMarkup(keyboard)
         
-        # Send the post
+        # Send the thumbnail with caption to the channel
         with open(thumbnail_path, 'rb') as thumb_file:
-            debug_log(f"Sending photo to {channel} with caption: {caption[:30]}...")
-            await context.bot.send_photo(
+            message = await context.bot.send_photo(
                 chat_id=channel,
                 photo=thumb_file,
                 caption=caption,
                 reply_markup=reply_markup
             )
+            
+            debug_log(f"Posted successfully to {channel_name} Channel, message ID: {message.message_id}")
         
         # Add to post history
         add_to_post_history(channel, caption, url, thumbnail_path)
-        debug_log("Post sent successfully")
         
-        return True
+        # Send confirmation to admin
+        await update.effective_message.reply_text(
+            f"✅ Post has been successfully sent to the {channel_name} Channel!\n\n"
+            f"Caption: {caption[:30]}{'...' if len(caption) > 30 else ''}\n"
+            f"URL: {url}"
+        )
+        
+        # Clean up user data and files
+        if 'video_path' in user_data[user_id]:
+            try_delete_file(user_data[user_id]['video_path'])
+        
+        if 'thumbnails' in user_data[user_id]:
+            for thumb_path in user_data[user_id]['thumbnails']:
+                if thumb_path != thumbnail_path:  # Don't delete the one we used
+                    try_delete_file(thumb_path)
+        
+        # Keep the selected thumbnail for post history
+        # We won't delete it, just remove from the user data
+        
+        del user_data[user_id]
+        save_session()
+        
+        return ConversationHandler.END
+        
     except Exception as e:
         logger.error(f"Error posting to channel: {e}")
-        debug_log(f"Exception in post_to_channel: {str(e)}")
-        return False
+        debug_log(f"Exception in select_channel: {str(e)}")
+        await query.edit_message_text(
+            f"❌ Sorry, there was an error posting to the {channel_name} Channel: {str(e)}"
+        )
+        return ConversationHandler.END
 
-def cleanup_user_files(user_id: int) -> None:
-    """Clean up files for the user but keep the necessary ones for history."""
-    debug_log(f"Cleaning up files for user {user_id}")
-    
-    if user_id not in user_data:
-        debug_log(f"No data to clean up for user {user_id}")
-        return
-    
-    # Clean up files except the selected thumbnail (which will be kept for history)
-    thumbnail_to_keep = user_data[user_id].get('thumbnail_path')
-    
-    # Remove video file
-    if 'video_path' in user_data[user_id]:
-        try_delete_file(user_data[user_id]['video_path'])
-    
-    # Remove other thumbnails
-    if 'thumbnails' in user_data[user_id]:
-        for thumb_path in user_data[user_id]['thumbnails']:
-            # Skip the selected thumbnail
-            if thumb_path == thumbnail_to_keep:
-                continue
-            try_delete_file(thumb_path)
-    
-    # Remove the user data
-    del user_data[user_id]
-    save_session()
-    debug_log(f"Cleanup completed for user {user_id}")
-
-def try_delete_file(file_path: str) -> bool:
-    """Try to delete a file, return True if successful, False otherwise."""
-    try:
-        if file_path and os.path.exists(file_path):
-            os.remove(file_path)
-            debug_log(f"Deleted file: {file_path}")
-            return True
-        return False
-    except Exception as e:
-        logger.error(f"Error deleting file {file_path}: {e}")
-        debug_log(f"Failed to delete file: {file_path}, Error: {str(e)}")
-        return False
-
-def extract_thumbnail(video_path: str, thumbnail_path: str, position: float = 0.5) -> bool:
-    """
-    Extract a thumbnail from the video at the specified position.
-    
-    Args:
-        video_path: Path to the video file
-        thumbnail_path: Path where the thumbnail should be saved
-        position: Position in the video (0.0 to 1.0) where to extract the thumbnail
-    
-    Returns:
-        True if successful, False otherwise
-    """
+def extract_thumbnail(video_path, output_path, position=0.5):
+    """Extract a thumbnail from the video at the specified position (0.0-1.0)."""
     try:
         debug_log(f"Extracting thumbnail from {video_path} at position {position}")
         
-        # Open the video file
-        cap = cv2.VideoCapture(video_path)
-        if not cap.isOpened():
-            logger.error(f"Could not open video file: {video_path}")
-            return False
-        
-        # Get total number of frames
-        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        
-        # Calculate frame position
-        frame_position = int(total_frames * position)
-        
-        # Set the position
-        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_position)
-        
-        # Read the frame
-        ret, frame = cap.read()
-        if not ret:
-            logger.error(f"Could not read frame at position {position}")
-            cap.release()
-            return False
-        
-        # Save the frame as an image
-        cv2.imwrite(thumbnail_path, frame)
-        
-        # Release the video file
-        cap.release()
-        
-        return os.path.exists(thumbnail_path)
+        with VideoFileClip(video_path) as video:
+            # Calculate the time position
+            time_pos = position * video.duration
+            
+            # Extract the frame
+            frame = video.get_frame(time_pos)
+            
+            # Convert the frame to an image and save it
+            img = Image.fromarray(frame)
+            img.save(output_path, quality=95)
+            
+            debug_log(f"Thumbnail saved to {output_path}")
+            return True
     except Exception as e:
         logger.error(f"Error extracting thumbnail: {e}")
-        debug_log(f"Exception in extract_thumbnail: {str(e)}")
+        debug_log(f"Failed to extract thumbnail: {str(e)}")
         return False
 
-def main() -> None:
-    """Run the bot."""
-    # Load session data
+def try_delete_file(file_path):
+    """Try to delete a file and log any errors."""
+    if file_path and os.path.exists(file_path):
+        try:
+            os.remove(file_path)
+            debug_log(f"Deleted file: {file_path}")
+            return True
+        except Exception as e:
+            logger.error(f"Error deleting file {file_path}: {e}")
+            debug_log(f"Failed to delete file {file_path}: {str(e)}")
+            return False
+    return False
+
+def main():
+    """Start the bot."""
+    # Load session and post history data
     load_session()
-    
-    # Load post history
     load_post_history()
     
-    # Create the Application and pass it your bot's token
+    # Set up application with token
     application = ApplicationBuilder().token(TOKEN).build()
     
-    # Add conversation handler for video processing
+    # Create conversation handler for main flow
     conv_handler = ConversationHandler(
         entry_points=[
-            CommandHandler('start', start),
+            CommandHandler("start", start),
             MessageHandler(filters.VIDEO, process_video)
         ],
         states={
+            WAITING_FOR_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_url)],
+            WAITING_FOR_CAPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_caption)],
+            WAITING_FOR_CHANNEL_SELECTION: [CallbackQueryHandler(select_channel)],
             WAITING_FOR_THUMBNAIL_SELECTION: [
-                CallbackQueryHandler(select_thumbnail, pattern=f"^{CALLBACK_THUMBNAIL_START}"),
-                CallbackQueryHandler(select_thumbnail, pattern=f"^{CALLBACK_THUMBNAIL_CUSTOM}$"),
+                CallbackQueryHandler(select_thumbnail),
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_custom_thumbnail)
             ],
-            WAITING_FOR_URL: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, process_url)
-            ],
-            WAITING_FOR_CAPTION: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, process_caption)
-            ],
-            WAITING_FOR_CHANNEL_SELECTION: [
-                CallbackQueryHandler(select_channel, pattern=f"^{CALLBACK_MOVIES}$|^{CALLBACK_STUFF}$")
-            ],
-            WAITING_FOR_BROADCAST_MESSAGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, process_broadcast_message)
-            ]
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
     
-    # Add conversation handler for broadcast messages
+    # Create conversation handler for broadcast flow
     broadcast_handler = ConversationHandler(
-        entry_points=[CommandHandler('broadcast', broadcast_command)],
+        entry_points=[CommandHandler("broadcast", broadcast_command)],
         states={
             WAITING_FOR_BROADCAST_MESSAGE: [
                 MessageHandler(filters.TEXT & ~filters.COMMAND, process_broadcast_message)
-            ]
+            ],
         },
-        fallbacks=[CommandHandler('cancel', cancel)]
+        fallbacks=[CommandHandler("cancel", cancel)],
     )
     
-    # Add command handlers
+    # Add handlers to application
     application.add_handler(conv_handler)
     application.add_handler(broadcast_handler)
-    application.add_handler(CommandHandler('help', help_command))
-    application.add_handler(CommandHandler('cancel', cancel))
-    application.add_handler(CommandHandler('debug', toggle_debug))
-    application.add_handler(CommandHandler('autostart', toggle_autostart))
-    application.add_handler(CommandHandler('status', status_command))
-    application.add_handler(CommandHandler('posts', posts_command))
-    application.add_handler(CommandHandler('cleanup', cleanup_command))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(CommandHandler("cancel", cancel))
+    application.add_handler(CommandHandler("status", status_command))
+    application.add_handler(CommandHandler("posts", posts_command))
+    application.add_handler(CommandHandler("debug", toggle_debug))
+    application.add_handler(CommandHandler("autostart", toggle_autostart))
+    application.add_handler(CommandHandler("cleanup", cleanup_command))
     
-    # Start the Bot
-    logger.info("Starting bot...")
-    application.run_polling()
+    # Set up webhook if configured
+    if USE_WEBHOOK and WEBHOOK_URL:
+        logger.info(f"Starting webhook on port {PORT}")
+        application.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            url_path=TOKEN,
+            webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
+        )
+    else:
+        # Start polling
+        logger.info("Starting polling")
+        application.run_polling()
 
 if __name__ == '__main__':
     main()
