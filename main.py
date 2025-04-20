@@ -1,708 +1,1007 @@
 import os
+import cv2
 import logging
-import time
-import asyncio
-from dotenv import load_dotenv
-import requests
-from telegram import Update, InlineKeyboardMarkup, InlineKeyboardButton
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, CallbackQueryHandler
-from telegram.error import NetworkError, TelegramError
-from pymongo import MongoClient
-import re
-import io
-import json
-from flask import Flask, jsonify
-
-# Create Flask app for health checks
-app = Flask(__name__)
-
-@app.route('/health')
-def health_check():
-    return jsonify({"status": "ok"})
+import pickle
+import datetime
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    ApplicationBuilder, CommandHandler, MessageHandler, 
+    ContextTypes, filters, ConversationHandler, CallbackQueryHandler
+)
 
 # Configure logging
 logging.basicConfig(
-    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", 
-    level=logging.INFO,
-    handlers=[
-        logging.FileHandler("bot.log"),
-        logging.StreamHandler()
-    ]
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
-# Load environment variables
-load_dotenv()
+# Configuration
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "6866329408:AAGDH0KcMlGAo9ZX3D4qzBQiuEcO42FoEyQ")
+CHANNEL_USERNAME = os.environ.get("MAIN_CHANNEL", "terao2")
+MOVIES_CHANNEL = os.environ.get("MOVIES_CHANNEL", "@diskmoviee")
+STUFF_CHANNEL = os.environ.get("STUFF_CHANNEL", "@dailydiskwala")
 
-# Bot configuration
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-# Updated API endpoints for better compatibility
-PRIMARY_API_URL = "https://api.teraboxdownloader.com/api/get_download_link?url="
-FALLBACK_API_URL = "https://terabox-dl-api.vercel.app/api/get_download_link?url="
-CHANNEL_USERNAME = os.getenv("CHANNEL_USERNAME", "@terao2")
-DUMP_CHANNEL_ID = os.getenv("DUMP_CHANNEL_ID")
-MONGO_URI = os.getenv("MONGO_URI")
-PORT = int(os.getenv("PORT", 8443))
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")
-WELCOME_VIDEO_REPO_URL = os.getenv("WELCOME_VIDEO_REPO_URL", "https://github.com/seeubot/Terabox/blame/main/tera.mp4")
-ADMIN_IDS = list(map(int, os.getenv("ADMIN_IDS", "1352497419").split(","))) if os.getenv("ADMIN_IDS") else []
+# Admin user ID - only this user can access the bot
+ADMIN_USER_ID = 1352497419
 
-# MongoDB connection
-client = None
-users_collection = None
-stats_collection = None
-db_connected = False
+# Debug and Auto-start settings
+DEBUG_MODE = os.environ.get("DEBUG_MODE", "False").lower() == "true"
+AUTO_START = os.environ.get("AUTO_START", "True").lower() == "true"
 
-# Set up a connection checker for MongoDB
-def check_db_connection():
-    global db_connected
-    if not client:
-        return False
-    
+# Session and history files
+SESSION_FILE = "bot_session.pickle"
+POSTS_FILE = "post_history.pickle"
+
+# Folder for temporary files
+TEMP_FOLDER = "temp"
+os.makedirs(TEMP_FOLDER, exist_ok=True)
+
+# Conversation states
+WAITING_FOR_URL = 0
+WAITING_FOR_CAPTION = 1
+WAITING_FOR_CHANNEL_SELECTION = 2
+WAITING_FOR_THUMBNAIL_SELECTION = 3
+WAITING_FOR_BROADCAST_MESSAGE = 4
+
+# Callback data constants
+CALLBACK_MOVIES = "channel_movies"
+CALLBACK_STUFF = "channel_stuff"
+CALLBACK_THUMBNAIL_START = "thumbnail_"
+CALLBACK_THUMBNAIL_CUSTOM = "thumbnail_custom"
+
+# User session and post history data
+user_data = {}
+post_history = []
+
+def debug_log(message):
+    """Log debug messages if debug mode is enabled."""
+    if DEBUG_MODE:
+        logger.info(f"DEBUG: {message}")
+
+def save_data(data, file_path):
+    """Generic function to save data to file."""
     try:
-        # The ismaster command is cheap and does not require auth
-        client.admin.command('ismaster')
-        if not db_connected:
-            logger.info("📂 Reconnected to MongoDB")
-            db_connected = True
+        with open(file_path, 'wb') as f:
+            pickle.dump(data, f)
         return True
     except Exception as e:
-        if db_connected:
-            logger.error(f"MongoDB connection lost: {e}")
-            db_connected = False
+        logger.error(f"Error saving data to {file_path}: {e}")
         return False
 
-# Initialize MongoDB client if MONGO_URI is provided
-if MONGO_URI:
+def load_data(file_path, default_value):
+    """Generic function to load data from file."""
     try:
-        client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-        db = client.telegramBot
-        users_collection = db.users
-        stats_collection = db.stats
-        db_connected = check_db_connection()
-        if db_connected:
-            logger.info("📂 Connected to MongoDB")
+        if os.path.exists(file_path):
+            with open(file_path, 'rb') as f:
+                return pickle.load(f)
+        return default_value
     except Exception as e:
-        logger.error(f"MongoDB connection error: {e}")
-        logger.warning("⚠️ Running without database connection")
-else:
-    logger.warning("⚠️ No MONGO_URI provided. Database functionality will be disabled.")
+        logger.error(f"Error loading data from {file_path}: {e}")
+        return default_value
 
-# Function to check if user is member of the channel
-async def is_user_member(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
-    try:
-        user_id = update.effective_user.id
-        chat_member = await context.bot.get_chat_member(chat_id=CHANNEL_USERNAME, user_id=user_id)
-        return chat_member.status in ["member", "administrator", "creator"]
-    except Exception as e:
-        logger.error(f"Error checking membership: {e}")
-        # If we can't check, assume they are a member to prevent blocking users unnecessarily
-        return True
+def save_session():
+    """Save the user_data to a file for persistence."""
+    if DEBUG_MODE:
+        debug_log("Saving session data...")
+    return save_data(user_data, SESSION_FILE)
 
-# Function to check if user is an admin
-def is_admin(user_id):
-    return user_id in ADMIN_IDS
+def load_session():
+    """Load the user_data from a file if it exists."""
+    global user_data
+    user_data = load_data(SESSION_FILE, {})
+    if DEBUG_MODE and user_data:
+        debug_log(f"Session data loaded. Active users: {list(user_data.keys())}")
 
-# Function to save user to database with retry
-async def save_user(user_id, username, retry=3):
-    if not db_connected:
-        check_db_connection()
-        if not db_connected:
-            return
-    
-    while retry > 0:
+def save_post_history():
+    """Save the post history to a file."""
+    if DEBUG_MODE:
+        debug_log(f"Saving post history with {len(post_history)} entries...")
+    return save_data(post_history, POSTS_FILE)
+
+def load_post_history():
+    """Load the post history from a file if it exists."""
+    global post_history
+    post_history = load_data(POSTS_FILE, [])
+    if DEBUG_MODE:
+        debug_log(f"Post history loaded with {len(post_history)} entries.")
+
+def add_to_post_history(channel, caption, url, thumbnail_path=None):
+    """Add a new post to the post history."""
+    # Save a copy of the thumbnail if available
+    saved_thumbnail = None
+    if thumbnail_path and os.path.exists(thumbnail_path):
         try:
-            users_collection.update_one(
-                {"userId": user_id},
-                {"$set": {"userId": user_id, "username": username, "lastActive": time.time()}},
-                upsert=True
-            )
-            # Update stats
-            stats_collection.update_one(
-                {"stat": "user_activity"},
-                {"$inc": {"count": 1}},
-                upsert=True
-            )
-            return
+            history_thumb_dir = os.path.join(TEMP_FOLDER, "history")
+            os.makedirs(history_thumb_dir, exist_ok=True)
+            
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            saved_thumbnail = os.path.join(history_thumb_dir, f"thumb_{timestamp}.jpg")
+            
+            import shutil
+            shutil.copy2(thumbnail_path, saved_thumbnail)
+            debug_log(f"Saved thumbnail copy for history: {saved_thumbnail}")
         except Exception as e:
-            retry -= 1
-            logger.error(f"Error saving user (retries left: {retry}): {e}")
-            time.sleep(1)
-            if retry == 0:
-                logger.error(f"Failed to save user after retries: {user_id}")
+            logger.error(f"Error saving thumbnail copy: {e}")
+            saved_thumbnail = None
 
-# Function to log activity stats
-async def log_activity(activity_type, success=True):
-    if not db_connected:
-        return
-    
-    try:
-        stats_collection.update_one(
-            {"stat": activity_type},
-            {"$inc": {"success" if success else "failure": 1, "total": 1}},
-            upsert=True
-        )
-    except Exception as e:
-        logger.error(f"Error logging activity: {e}")
-
-# Function to extract TeraBox ID from link
-def extract_terabox_id(text):
-    # Handle multiple formats of TeraBox links
-    match = re.search(r"/s/([a-zA-Z0-9_-]+)", text)
-    if match:
-        return match.group(1)
-    
-    # Check if it's a full URL with ID as query parameter
-    query_match = re.search(r"id=([a-zA-Z0-9_-]+)", text)
-    if query_match:
-        return query_match.group(1)
-    
-    # If no patterns match, return the original text stripped
-    return text.strip()
-
-# Enhanced function to send message/file to dump channel with retries
-async def send_to_dump_channel(context: ContextTypes.DEFAULT_TYPE, content, is_text=True, caption=None, file_type=None, retries=3):
-    if not DUMP_CHANNEL_ID:
-        return
-    
-    retry_count = 0
-    while retry_count < retries:
-        try:
-            if is_text:
-                await context.bot.send_message(chat_id=DUMP_CHANNEL_ID, text=content)
-                return True
-            else:
-                if file_type == "photo":
-                    await context.bot.send_photo(chat_id=DUMP_CHANNEL_ID, photo=content, caption=caption)
-                elif file_type == "video":
-                    # Check if content is bytes or file_id
-                    if isinstance(content, bytes):
-                        await context.bot.send_video(
-                            chat_id=DUMP_CHANNEL_ID, 
-                            video=io.BytesIO(content), 
-                            caption=caption
-                        )
-                    else:
-                        await context.bot.send_video(
-                            chat_id=DUMP_CHANNEL_ID, 
-                            video=content, 
-                            caption=caption
-                        )
-                elif file_type == "document":
-                    await context.bot.send_document(chat_id=DUMP_CHANNEL_ID, document=content, caption=caption)
-                elif file_type == "audio":
-                    await context.bot.send_audio(chat_id=DUMP_CHANNEL_ID, audio=content, caption=caption)
-                return True
-        except NetworkError as ne:
-            logger.warning(f"Network error sending to dump channel (retry {retry_count+1}/{retries}): {ne}")
-            retry_count += 1
-            await asyncio.sleep(2)  # Wait before retrying
-        except TelegramError as te:
-            logger.error(f"Telegram error sending to dump channel: {te}")
-            return False
-        except Exception as e:
-            logger.error(f"Error sending to dump channel: {e}")
-            return False
-    
-    logger.error(f"Failed to send to dump channel after {retries} retries")
-    return False
-
-# Updated function to fetch video from primary or fallback API with improved error handling
-async def fetch_video(video_id, max_retries=3):
-    # Construct full URLs if necessary
-    if not video_id.startswith("http"):
-        video_url = f"https://terabox.com/s/{video_id}"
-    else:
-        video_url = video_id
-    
-    primary_retries = max_retries
-    while primary_retries > 0:
-        try:
-            # Try primary API with full URL
-            response = requests.get(f"{PRIMARY_API_URL}{video_url}", timeout=15)
-            response_data = response.json()
-            
-            if response_data:
-                # Check for success in different formats
-                if response_data.get('success') == True or response_data.get('status') == "success":
-                    return {"success": True, "data": response_data.get('data', response_data), "source": "primary"}
-            
-            # If API responded but with error, log it
-            error_msg = response_data.get('error', response_data.get('message', 'Unknown error'))
-            logger.warning(f"Primary API error response: {error_msg}")
-            
-            # Break out to try fallback
-            break
-        except requests.exceptions.Timeout:
-            logger.warning(f"Primary API timeout (retries left: {primary_retries-1})")
-            primary_retries -= 1
-            if primary_retries > 0:
-                time.sleep(2)  # Wait before retry
-        except Exception as primary_error:
-            logger.warning(f"Primary API error: {primary_error}")
-            break
-    
-    logger.info("Primary API failed or timed out, trying fallback...")
-    
-    fallback_retries = max_retries
-    while fallback_retries > 0:
-        try:
-            # Try fallback API
-            fallback_response = requests.get(f"{FALLBACK_API_URL}{video_url}", timeout=15)
-            fallback_data = fallback_response.json()
-            
-            if fallback_data:
-                # Check for success in different formats
-                if fallback_data.get('success') == True or fallback_data.get('status') == "success":
-                    return {"success": True, "data": fallback_data.get('data', fallback_data), "source": "fallback"}
-            
-            # If API responded but with error, log it
-            error_msg = fallback_data.get('error', fallback_data.get('message', 'Unknown error'))
-            logger.warning(f"Fallback API error response: {error_msg}")
-            
-            # Break out
-            break
-        except requests.exceptions.Timeout:
-            logger.warning(f"Fallback API timeout (retries left: {fallback_retries-1})")
-            fallback_retries -= 1
-            if fallback_retries > 0:
-                time.sleep(2)  # Wait before retry
-        except Exception as fallback_error:
-            logger.error(f"Fallback API error: {fallback_error}")
-            break
-    
-    return {"success": False, "error": "Both APIs failed to fetch the video"}
-
-# Function to fetch welcome video from repo with retry mechanism
-async def fetch_welcome_video(retries=3):
-    for attempt in range(retries):
-        try:
-            response = requests.get(WELCOME_VIDEO_REPO_URL, stream=True, timeout=30)
-            if response.status_code == 200:
-                return response.content
-            logger.error(f"Failed to fetch welcome video. Status code: {response.status_code}")
-        except Exception as e:
-            logger.error(f"Error fetching welcome video (attempt {attempt+1}/{retries}): {e}")
-        
-        if attempt < retries - 1:
-            time.sleep(2)  # Wait before retry
-    
-    return None
-
-# Function to broadcast message to all users with progress tracking
-async def broadcast_message(context: ContextTypes.DEFAULT_TYPE, message_text, send_by=None, batch_size=100, delay=1):
-    if not db_connected:
-        logger.error("Cannot broadcast: No database connection")
-        return {"success": False, "error": "No database connection"}
-    
-    success_count = 0
-    fail_count = 0
-    
-    total_users = users_collection.count_documents({})
-    
-    # Process users in batches to avoid memory issues with large user bases
-    cursor = users_collection.find({})
-    batch = []
-    processed = 0
-    
-    for user in cursor:
-        batch.append(user)
-        
-        if len(batch) >= batch_size:
-            # Process the batch
-            for user_doc in batch:
-                try:
-                    user_id = user_doc.get("userId")
-                    if user_id:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text=f"{message_text}\n\n{f'Message from: {send_by}' if send_by else ''}"
-                        )
-                        success_count += 1
-                except Exception as e:
-                    logger.error(f"Failed to send broadcast to {user_doc.get('userId')}: {e}")
-                    fail_count += 1
-            
-            # Clear batch and add delay to avoid hitting rate limits
-            batch = []
-            processed += batch_size
-            logger.info(f"Broadcast progress: {processed}/{total_users}")
-            await asyncio.sleep(delay)
-    
-    # Process remaining users
-    for user_doc in batch:
-        try:
-            user_id = user_doc.get("userId")
-            if user_id:
-                await context.bot.send_message(
-                    chat_id=user_id,
-                    text=f"{message_text}\n\n{f'Message from: {send_by}' if send_by else ''}"
-                )
-                success_count += 1
-        except Exception as e:
-            logger.error(f"Failed to send broadcast to {user_doc.get('userId')}: {e}")
-            fail_count += 1
-    
-    await log_activity("broadcast", success=(success_count > 0))
-    
-    return {
-        "success": True,
-        "total": total_users,
-        "sent": success_count,
-        "failed": fail_count
+    # Create new post entry
+    post_entry = {
+        "timestamp": datetime.datetime.now().isoformat(),
+        "channel": channel,
+        "caption": caption,
+        "url": url,
+        "thumbnail_path": saved_thumbnail
     }
+    
+    # Add to history and save
+    post_history.append(post_entry)
+    save_post_history()
+    debug_log(f"Added new post to history. Total posts: {len(post_history)}")
 
-# Command handlers
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def check_admin(update: Update) -> bool:
+    """Check if the user is the admin."""
     user_id = update.effective_user.id
-    username = update.effective_user.username or "Unknown"
+    debug_log(f"User ID {user_id} authorization check against ADMIN_USER_ID {ADMIN_USER_ID}")
     
-    # Save user data
-    await save_user(user_id, username)
-    
-    # Log new user
-    await send_to_dump_channel(context, f"🆕 New user joined: @{username} ({user_id})")
-    
-    # Fetch and send welcome video
-    welcome_video = await fetch_welcome_video()
-    if welcome_video:
-        await update.message.reply_video(
-            video=welcome_video,
-            caption="Welcome to TeraBox Downloader Bot! 🎬\n\nSend me a TeraBox link or Video ID, and I'll download it for you."
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text(
+            "Sorry, you're not authorized to use this bot. This bot is only for admin use."
         )
-    else:
-        await update.message.reply_text("Welcome to TeraBox Downloader Bot! 🎬\n\nSend me a TeraBox link or Video ID, and I'll download it for you.")
+        debug_log(f"Authorization denied for user {user_id}")
+        return False
     
-    await log_activity("start_command")
+    debug_log(f"Authorization granted for admin {user_id}")
+    return True
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /start is issued."""
+    # Check if user is admin
+    if not await check_admin(update):
+        return
+    
+    debug_log("Start command executed by admin")
+    
+    await update.message.reply_text(
+        f"Hi admin! I'm your channel posting bot. "
+        f"Just send me a video or forward a video from another chat and I'll extract multiple thumbnails for you to choose from. "
+        f"Afterward, I'll ask for a URL and caption to add to the post, "
+        f"and you can choose which channel to post it to.\n\n"
+        f"💡 Current settings:\n"
+        f"- Debug mode: {'✅ ON' if DEBUG_MODE else '❌ OFF'}\n"
+        f"- Auto-start: {'✅ ON' if AUTO_START else '❌ OFF'}"
+    )
+
+async def toggle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle debug mode on/off."""
+    global DEBUG_MODE
+    
+    # Check if user is admin
+    if not await check_admin(update):
+        return
+    
+    DEBUG_MODE = not DEBUG_MODE
+    debug_status = "enabled" if DEBUG_MODE else "disabled"
+    
+    logger.info(f"Debug mode {debug_status} by admin")
+    
+    await update.message.reply_text(f"Debug mode is now {debug_status}.")
+    
+    if DEBUG_MODE:
+        # Print current configuration when debug is enabled
+        debug_log(f"Current configuration: TOKEN={TOKEN[:5]}... ADMIN_USER_ID={ADMIN_USER_ID}")
+        debug_log(f"Channels: Main={CHANNEL_USERNAME}, Movies={MOVIES_CHANNEL}, Stuff={STUFF_CHANNEL}")
+        debug_log(f"Auto-start: {AUTO_START}")
+
+async def toggle_autostart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Toggle auto-start mode on/off."""
+    global AUTO_START
+    
+    # Check if user is admin
+    if not await check_admin(update):
+        return
+    
+    AUTO_START = not AUTO_START
+    status = "enabled" if AUTO_START else "disabled"
+    
+    debug_log(f"Auto-start mode {status} by admin")
+    
+    await update.message.reply_text(
+        f"Auto-start mode is now {status}.\n\n"
+        f"{'✅ Videos will be processed immediately without needing to send /start first' if AUTO_START else '❌ You need to send /start before processing videos'}"
+    )
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Send a message when the command /help is issued."""
+    # Check if user is admin
+    if not await check_admin(update):
+        return
+    
+    debug_log("Help command executed by admin")
+    
     await update.message.reply_text(
-        "🔍 *How to use this bot:*\n\n" +
-        "1. Join our channel: " + CHANNEL_USERNAME + "\n" +
-        "2. Send a TeraBox link (e.g., https://terabox.com/s/abc123)\n" +
-        "3. Wait for the bot to process and download your video\n\n" +
-        "If you have any issues, please try again later.",
-        parse_mode="Markdown"
+        "Admin commands:\n\n"
+        "Send me a video file or forward a video from another chat and I'll generate multiple thumbnails for you to choose from.\n\n"
+        "After selecting a thumbnail, I'll ask you for:\n"
+        "1. A URL to link to\n"
+        "2. A caption to display under the thumbnail\n"
+        "3. Which channel to post to (MOVIES or STUFF)\n\n"
+        "Commands:\n"
+        "/start - Start the bot\n"
+        "/help - Show this help message\n"
+        "/cancel - Cancel the current operation\n"
+        "/status - Check bot status and channels\n"
+        "/posts - View history of posts sent by the bot\n"
+        "/debug - Toggle debug mode on/off\n"
+        "/autostart - Toggle auto-start mode on/off\n"
+        "/cleanup - Remove temporary files and clear sessions\n"
+        "/broadcast - Send a message to all channels"
     )
-    await log_activity("help_command")
 
-# Admin commands
-async def stats_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this command")
+async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clean up temporary files and user sessions."""
+    # Check if user is admin
+    if not await check_admin(update):
         return
     
-    if not db_connected and not check_db_connection():
-        await update.message.reply_text("⚠️ No database connection available")
-        return
+    debug_log("Cleanup command executed by admin")
     
-    total_users = users_collection.count_documents({})
+    # Clean up all files in the temp folder, except history subfolder
+    files_removed = 0
+    for filename in os.listdir(TEMP_FOLDER):
+        file_path = os.path.join(TEMP_FOLDER, filename)
+        try:
+            if os.path.isfile(file_path):
+                os.unlink(file_path)
+                files_removed += 1
+            elif os.path.isdir(file_path) and filename != "history":
+                # If it's a directory but not the history folder, we can remove its contents
+                import shutil
+                shutil.rmtree(file_path)
+                debug_log(f"Removed directory: {file_path}")
+        except Exception as e:
+            debug_log(f"Failed to delete {file_path}: {e}")
     
-    # Get activity stats
-    activity_stats = {}
-    try:
-        cursor = stats_collection.find({})
-        for doc in cursor:
-            if doc.get("stat") != "heartbeat":
-                activity_stats[doc.get("stat")] = doc
-    except Exception as e:
-        logger.error(f"Error fetching stats: {e}")
+    # Clear user data
+    user_count = len(user_data)
+    user_data.clear()
+    save_session()
     
-    stats_text = f"📊 *Bot Statistics*\n\n" + \
-                f"Total users: {total_users}\n" + \
-                f"Database status: {'✅ Connected' if db_connected else '❌ Disconnected'}\n\n"
-    
-    if activity_stats:
-        stats_text += "*Activity Metrics:*\n"
-        for stat_name, stat_data in activity_stats.items():
-            stats_text += f"- {stat_name}: {stat_data.get('total', 0)} total"
-            if "success" in stat_data:
-                success_rate = (stat_data.get('success', 0) / stat_data.get('total', 1)) * 100
-                stats_text += f" ({success_rate:.1f}% success rate)\n"
-            else:
-                stats_text += "\n"
-    
-    await update.message.reply_text(stats_text, parse_mode="Markdown")
+    await update.message.reply_text(
+        f"Cleanup completed:\n"
+        f"- {files_removed} temporary files removed\n"
+        f"- {user_count} user sessions cleared\n"
+        f"- Post history remains intact"
+    )
 
-async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this command")
+async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Check bot status and configured channels."""
+    # Check if user is admin
+    if not await check_admin(update):
         return
     
-    if not context.args or len(" ".join(context.args)) < 1:
+    debug_log("Status command executed by admin")
+    
+    # Count temp files
+    temp_file_count = len([name for name in os.listdir(TEMP_FOLDER) if os.path.isfile(os.path.join(TEMP_FOLDER, name))])
+    
+    # Get active sessions
+    active_sessions = len(user_data)
+    
+    # Get post count
+    post_count = len(post_history)
+    
+    status_message = (
+        "🤖 Bot Status: Running\n\n"
+        f"📢 Main Channel: {CHANNEL_USERNAME}\n"
+        f"🎬 Movies Channel: {MOVIES_CHANNEL}\n"
+        f"📦 Stuff Channel: {STUFF_CHANNEL}\n\n"
+        f"🔐 Admin ID: {ADMIN_USER_ID}\n\n"
+        f"🔧 Settings:\n"
+        f"- Debug mode: {'✅ ON' if DEBUG_MODE else '❌ OFF'}\n"
+        f"- Auto-start: {'✅ ON' if AUTO_START else '❌ OFF'}\n\n"
+        f"📊 System:\n"
+        f"- Temporary files: {temp_file_count}\n"
+        f"- Active sessions: {active_sessions}\n"
+        f"- Posts sent: {post_count}"
+    )
+    
+    await update.message.reply_text(status_message)
+
+async def broadcast_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Start the broadcast message process."""
+    # Check if user is admin
+    if not await check_admin(update):
+        return ConversationHandler.END
+    
+    debug_log("Broadcast command executed by admin")
+    
+    await update.message.reply_text(
+        "📣 Please enter the message you want to broadcast to all channels.\n\n"
+        "This message will be sent to both the MOVIES and STUFF channels."
+    )
+    
+    return WAITING_FOR_BROADCAST_MESSAGE
+
+async def process_broadcast_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process the broadcast message and send it to all channels."""
+    # Check if user is admin
+    if not await check_admin(update):
+        return ConversationHandler.END
+    
+    broadcast_message = update.message.text
+    debug_log(f"Broadcast message received: {broadcast_message[:30]}...")
+    
+    channels = [MOVIES_CHANNEL, STUFF_CHANNEL]
+    successful_channels = []
+    
+    # Add the join channel buttons
+    keyboard = []
+    for channel_id, channel_name in [(MOVIES_CHANNEL, "Join Movies Channel"), (STUFF_CHANNEL, "Join Stuff Channel")]:
+        # Extract clean channel name for the URL
+        clean_channel = channel_id.replace("@", "")
+        keyboard.append([InlineKeyboardButton(channel_name, url=f"https://t.me/{clean_channel}")])
+    
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Send the message to each channel
+    for channel in channels:
+        try:
+            debug_log(f"Sending broadcast to channel: {channel}")
+            await context.bot.send_message(
+                chat_id=channel,
+                text=broadcast_message,
+                reply_markup=reply_markup
+            )
+            successful_channels.append(channel)
+        except Exception as e:
+            logger.error(f"Error broadcasting to {channel}: {e}")
+    
+    # Send confirmation to admin
+    if successful_channels:
         await update.message.reply_text(
-            "⚠️ Please provide a message to broadcast.\n" +
-            "Usage: /broadcast <message>"
-        )
-        return
-    
-    broadcast_text = " ".join(context.args)
-    username = update.effective_user.username or "Admin"
-    
-    await update.message.reply_text("🔄 Broadcasting message to all users...")
-    
-    result = await broadcast_message(context, broadcast_text, f"@{username}")
-    
-    if result["success"]:
-        await update.message.reply_text(
-            f"✅ Broadcast completed\n" +
-            f"Total users: {result['total']}\n" +
-            f"Successfully sent: {result['sent']}\n" +
-            f"Failed: {result['failed']}"
+            f"✅ Broadcast message sent successfully to {len(successful_channels)} channels."
         )
     else:
-        await update.message.reply_text(f"❌ Broadcast failed: {result.get('error', 'Unknown error')}")
-
-# Function to forward files to dump channel
-async def forward_to_dump(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    user_id = update.effective_user.id
-    
-    if not is_admin(user_id):
-        await update.message.reply_text("⛔ You are not authorized to use this command")
-        return
-    
-    if not update.message.reply_to_message:
-        await update.message.reply_text("⚠️ Please reply to a message containing media that you want to forward to the dump channel")
-        return
-    
-    original_msg = update.message.reply_to_message
-    username = update.effective_user.username or "Admin"
-    caption = f"Forwarded by @{username}"
-    
-    if original_msg.photo:
-        photo = original_msg.photo[-1].file_id
-        success = await send_to_dump_channel(context, photo, is_text=False, caption=caption, file_type="photo")
-        await update.message.reply_text("✅ Photo forwarded to dump channel" if success else "❌ Failed to forward photo")
-    
-    elif original_msg.video:
-        video = original_msg.video.file_id
-        success = await send_to_dump_channel(context, video, is_text=False, caption=caption, file_type="video")
-        await update.message.reply_text("✅ Video forwarded to dump channel" if success else "❌ Failed to forward video")
-    
-    elif original_msg.document:
-        document = original_msg.document.file_id
-        success = await send_to_dump_channel(context, document, is_text=False, caption=caption, file_type="document")
-        await update.message.reply_text("✅ Document forwarded to dump channel" if success else "❌ Failed to forward document")
-    
-    elif original_msg.audio:
-        audio = original_msg.audio.file_id
-        success = await send_to_dump_channel(context, audio, is_text=False, caption=caption, file_type="audio")
-        await update.message.reply_text("✅ Audio forwarded to dump channel" if success else "❌ Failed to forward audio")
-    
-    else:
-        await update.message.reply_text("❌ No media found in the replied message")
-
-# Updated handle_message function with improved error handling
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    # Check if the message has text
-    if not update.message or not update.message.text:
-        return
-    
-    user_id = update.effective_user.id
-    username = update.effective_user.username or "Unknown"
-    
-    # Save user data
-    await save_user(user_id, username)
-    
-    # Check if user is member of the channel
-    if not await is_user_member(update, context):
-        join_button = InlineKeyboardButton("Join Channel", url=f"https://t.me/{CHANNEL_USERNAME.replace('@', '')}")
-        reply_markup = InlineKeyboardMarkup([[join_button]])
         await update.message.reply_text(
-            "🔒 You need to join our channel to use this bot.\n" +
-            f"Join: {CHANNEL_USERNAME}\n\n" +
-            "After joining, send your link again.",
-            reply_markup=reply_markup
+            "❌ Failed to send broadcast message to any channels."
+        )
+    
+    return ConversationHandler.END
+
+async def posts_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Display history of posts sent by the bot."""
+    # Check if user is admin
+    if not await check_admin(update):
+        return
+    
+    debug_log("Posts command executed by admin")
+    
+    # Check if there are any posts in history
+    if not post_history:
+        await update.message.reply_text(
+            "No posts found in history. Posts will be tracked once you start sending them."
         )
         return
     
-    message_text = update.message.text.strip()
+    # Get argument for number of posts to display (default to 5)
+    args = context.args
+    try:
+        limit = int(args[0]) if args else 5
+        # Ensure limit is reasonable
+        limit = max(1, min(limit, 20))
+    except (ValueError, IndexError):
+        limit = 5
     
-    # Log the received message to dump channel
-    await send_to_dump_channel(context, f"📥 Received from @{username} ({user_id}):\n{message_text}")
+    # Get the most recent posts (up to the limit)
+    recent_posts = post_history[-limit:]
     
-    # Extract TeraBox ID
-    terabox_id = extract_terabox_id(message_text)
+    await update.message.reply_text(
+        f"📝 Recent Posts (showing {len(recent_posts)} of {len(post_history)} total posts):"
+    )
     
-    if not terabox_id:
-        await update.message.reply_text("⚠️ Invalid link format. Please send a valid TeraBox link.")
-        return
-    
-    # Send processing message
-    processing_message = await update.message.reply_text("🔄 Processing your request...")
-    
-    # Fetch video
-    video_result = await fetch_video(terabox_id)
-    
-    # Add debugging
-    if not video_result["success"]:
-        error_msg = "❌ Failed to fetch video.\n\n"
-        logger.error(f"API response: {video_result.get('error', 'Unknown error')}")
+    # Send information about each post
+    for i, post in enumerate(reversed(recent_posts)):
+        # Format timestamp
+        try:
+            timestamp = datetime.datetime.fromisoformat(post["timestamp"])
+            formatted_time = timestamp.strftime("%Y-%m-%d %H:%M:%S")
+        except:
+            formatted_time = post.get("timestamp", "Unknown")
         
-        # Log the response to dump channel for debugging
-        if DUMP_CHANNEL_ID:
-            await send_to_dump_channel(context, f"DEBUG - API Response for {terabox_id}: {json.dumps(video_result)}")
-        
-        await processing_message.edit_text(
-            error_msg +
-            "Possible reasons:\n" +
-            "1. Invalid or expired link\n" +
-            "2. The file may be too large\n" +
-            "3. Our servers might be busy\n\n" +
-            "Please try again later or try a different link."
+        # Prepare post info message
+        post_info = (
+            f"📌 Post #{len(post_history) - (len(post_history) - post_history.index(post))}:\n"
+            f"📅 Date: {formatted_time}\n"
+            f"📣 Channel: {post.get('channel', 'Unknown')}\n"
+            f"🔗 URL: {post.get('url', 'None')}\n"
+            f"📝 Caption: {post.get('caption', 'None')[:100]}{'...' if len(post.get('caption', '')) > 100 else ''}"
         )
-        await log_activity("video_fetch", success=False)
-        return
-    
-    video_data = video_result["data"]
-    
-    # Improved error handling for video data
-    if not video_data:
-        await processing_message.edit_text("❌ No data received from API.")
-        await log_activity("video_fetch", success=False)
-        return
+        
+        # If we have a thumbnail, send it with the post info
+        thumbnail_path = post.get("thumbnail_path")
+        if thumbnail_path and os.path.exists(thumbnail_path):
+            try:
+                with open(thumbnail_path, 'rb') as thumb_file:
+                    await update.message.reply_photo(
+                        photo=thumb_file,
+                        caption=post_info
+                    )
+            except Exception as e:
+                logger.error(f"Error sending thumbnail: {e}")
+                await update.message.reply_text(
+                    f"{post_info}\n\n(Thumbnail file could not be loaded: {str(e)})"
+                )
+        else:
+            await update.message.reply_text(f"{post_info}\n\n(No thumbnail available)")
 
-    # Be more flexible with the expected response structure
-    if not isinstance(video_data, dict):
-        await processing_message.edit_text("❌ Invalid response format from API.")
-        await log_activity("video_fetch", success=False)
-        # Log actual response for debugging
-        await send_to_dump_channel(context, f"INVALID FORMAT - {json.dumps(video_data)}")
-        return
-
-    # Check for file list in different possible locations in the response
-    file_list = video_data.get("list", [])
-    if not file_list and "files" in video_data:
-        file_list = video_data.get("files", [])
-    # Check for nested data structure
-    elif not file_list and isinstance(video_data.get("data"), dict):
-        file_list = video_data.get("data", {}).get("list", [])
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Cancel the conversation."""
+    # Check if user is admin
+    if not await check_admin(update):
+        return ConversationHandler.END
     
-    if not file_list:
-        await processing_message.edit_text("❌ No files found in this link.")
-        # Log the actual response structure for debugging
-        await send_to_dump_channel(context, f"NO FILES - Response structure: {json.dumps(video_data)}")
-        return
+    debug_log("Cancel command executed by admin")
+    
+    user_id = update.effective_user.id
+    if user_id in user_data:
+        # Clean up any files before canceling
+        if 'video_path' in user_data[user_id]:
+            try_delete_file(user_data[user_id]['video_path'])
+        
+        if 'thumbnails' in user_data[user_id]:
+            for thumb_path in user_data[user_id]['thumbnails']:
+                try_delete_file(thumb_path)
+        
+        if 'thumbnail_path' in user_data[user_id]:
+            try_delete_file(user_data[user_id]['thumbnail_path'])
+            
+        del user_data[user_id]
+        save_session()
+        debug_log(f"Session for user {user_id} has been cleared")
+    
+    await update.message.reply_text("Operation cancelled.")
+    return ConversationHandler.END
+
+async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process the video and generate multiple thumbnails."""
+    # Check if user is admin
+    if not await check_admin(update):
+        return ConversationHandler.END
+    
+    user_id = update.effective_user.id
+    
+    # Check if auto-start is disabled and no prior conversation exists
+    if not AUTO_START and user_id not in user_data:
+        debug_log("Auto-start is disabled, requiring explicit /start")
+        await update.message.reply_text(
+            "Please use the /start command first before sending videos. "
+            "Alternatively, you can enable auto-start mode with /autostart."
+        )
+        return ConversationHandler.END
+    
+    # Notify the user that processing has started
+    debug_log(f"Processing video from user {user_id}")
+    await update.message.reply_text("Processing your video... Please wait.")
     
     try:
-        # Process each file
-        for file_info in file_list:
-            file_name = file_info.get("name", "Unknown")
-            file_size = file_info.get("size", 0)
-            file_size_mb = file_size / (1024 * 1024)  # Convert to MB
+        # Get the video file
+        video = await update.message.video.get_file()
+        video_file_id = update.message.video.file_id
+        video_path = os.path.join(TEMP_FOLDER, f"{video_file_id}.mp4")
+        
+        debug_log(f"Downloading video {video_file_id} to {video_path}")
+        await video.download_to_drive(video_path)
+        
+        # Initialize user data
+        user_data[user_id] = {
+            'video_path': video_path,
+            'thumbnails': []
+        }
+        save_session()
+        
+        # Get video metadata
+        if DEBUG_MODE:
+            file_size_mb = update.message.video.file_size / (1024 * 1024)
+            duration = update.message.video.duration
+            debug_log(f"Video metadata: Size={file_size_mb:.2f}MB, Duration={duration}s")
+        
+        # Generate multiple thumbnails at different positions
+        positions = [0.1, 0.25, 0.5, 0.75, 0.9]  # Positions for thumbnails
+        thumbnails = []
+        
+        for i, pos in enumerate(positions):
+            thumbnail_path = os.path.join(TEMP_FOLDER, f"{video_file_id}_thumbnail_{i}.jpg")
+            debug_log(f"Extracting thumbnail {i+1} at position {pos*100:.0f}%")
+            success = extract_thumbnail(video_path, thumbnail_path, pos)
             
-            # Format size for display
-            if file_size_mb > 1024:
-                formatted_size = f"{file_size_mb/1024:.1f} GB"
+            if success:
+                thumbnails.append(thumbnail_path)
+                user_data[user_id]['thumbnails'].append(thumbnail_path)
+                debug_log(f"Thumbnail {i+1} extracted successfully to {thumbnail_path}")
             else:
-                formatted_size = f"{file_size_mb:.1f} MB"
+                debug_log(f"Failed to extract thumbnail {i+1}")
+        
+        save_session()
+        
+        if thumbnails:
+            # Send thumbnails with buttons for selection
+            keyboard = []
+            for i, _ in enumerate(thumbnails):
+                callback_data = f"{CALLBACK_THUMBNAIL_START}{i}"
+                keyboard.append([InlineKeyboardButton(f"Thumbnail {i+1}", callback_data=callback_data)])
             
-            # Get download links - check multiple possible locations
-            download_url = file_info.get("url", "")
-            if not download_url and "dlink" in file_info:
-                download_url = file_info.get("dlink", "")
-            if not download_url and "download_url" in file_info:
-                download_url = file_info.get("download_url", "")
+            # Add option for custom position
+            keyboard.append([InlineKeyboardButton("Custom Position (0-100%)", callback_data=CALLBACK_THUMBNAIL_CUSTOM)])
             
-            if not download_url:
-                # Log detailed error for debugging
-                await send_to_dump_channel(context, f"NO URL - File info: {json.dumps(file_info)}")
-                await processing_message.edit_text(f"❌ Download URL not found for {file_name}")
-                continue
-            
-            # Create keyboard with download button
-            keyboard = [
-                [InlineKeyboardButton("⬇️ Download", url=download_url)]
-            ]
             reply_markup = InlineKeyboardMarkup(keyboard)
             
-            # Send file info and download link
-            await processing_message.edit_text(
-                f"✅ File Ready\n\n" +
-                f"📁 Name: {file_name}\n" +
-                f"📊 Size: {formatted_size}\n\n" +
-                f"📥 Click the button below to download:",
+            debug_log(f"Sending {len(thumbnails)} thumbnails to user")
+            
+            # Send all thumbnails
+            for i, thumb_path in enumerate(thumbnails):
+                with open(thumb_path, 'rb') as thumb_file:
+                    await update.message.reply_photo(
+                        photo=thumb_file, 
+                        caption=f"Thumbnail {i+1} (from position {positions[i]*100:.0f}%)"
+                    )
+            
+            # Send selection message
+            await update.message.reply_text(
+                "Please select one of the thumbnails above:",
                 reply_markup=reply_markup
             )
             
-            # Log successful fetch
-            await log_activity("video_fetch", success=True)
-            
-            # Send success message to dump channel
-            await send_to_dump_channel(
-                context, 
-                f"✅ Success for @{username} ({user_id}):\n" +
-                f"File: {file_name}\n" +
-                f"Size: {formatted_size}\n" +
-                f"API Source: {video_result['source']}"
-            )
+            return WAITING_FOR_THUMBNAIL_SELECTION
+        else:
+            debug_log("No thumbnails could be generated")
+            await update.message.reply_text("Sorry, I couldn't generate thumbnails from your video.")
+            # Clean up files
+            try_delete_file(video_path)
+            # Remove user data
+            if user_id in user_data:
+                del user_data[user_id]
+                save_session()
+            return ConversationHandler.END
             
     except Exception as e:
         logger.error(f"Error processing video: {e}")
-        # Log the full exception traceback
-        import traceback
-        tb = traceback.format_exc()
-        await send_to_dump_channel(context, f"ERROR TRACEBACK:\n{tb}")
-        
-        await processing_message.edit_text(
-            "❌ An error occurred while processing the video.\n" +
-            "Please try again later."
+        debug_log(f"Exception in process_video: {str(e)}")
+        await update.message.reply_text(
+            "Sorry, there was an error processing your video. Please try again later."
         )
-        await log_activity("video_fetch", success=False)
+        return ConversationHandler.END
 
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Log the error and send a telegram message to notify the developer."""
-    logger.error(f"Exception while handling an update: {context.error}")
+async def select_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle thumbnail selection."""
+    query = update.callback_query
+    await query.answer()
     
-    # Log to dump channel if available
-    if DUMP_CHANNEL_ID:
-        error_message = f"⚠️ ERROR: {context.error}"
-        await send_to_dump_channel(context, error_message)
+    user_id = query.from_user.id
+    debug_log(f"Thumbnail selection callback from user {user_id}: {query.data}")
+    
+    # Check if user is admin
+    if user_id != ADMIN_USER_ID:
+        debug_log(f"Unauthorized user {user_id} attempted to select thumbnail")
+        await query.edit_message_text("You're not authorized to use this bot.")
+        return ConversationHandler.END
+    
+    if user_id not in user_data:
+        debug_log(f"No active session for user {user_id}")
+        await query.edit_message_text("Sorry, there was an error. Please start over by sending a video.")
+        return ConversationHandler.END
+    
+    # Handle custom thumbnail request
+    if query.data == CALLBACK_THUMBNAIL_CUSTOM:
+        debug_log("User requested custom thumbnail position")
+        await query.edit_message_text(
+            "Please specify a position between 0-100% (just type a number like '30' for 30%):"
+        )
+        
+        # We'll stay in the same state, but process text input instead
+        return WAITING_FOR_THUMBNAIL_SELECTION
+    
+    # Handle selection of predefined thumbnail
+    thumbnail_index = int(query.data.replace(CALLBACK_THUMBNAIL_START, ""))
+    debug_log(f"User selected predefined thumbnail {thumbnail_index + 1}")
+    
+    if 'thumbnails' in user_data[user_id] and thumbnail_index < len(user_data[user_id]['thumbnails']):
+        user_data[user_id]['thumbnail_path'] = user_data[user_id]['thumbnails'][thumbnail_index]
+        save_session()
+        
+        await query.edit_message_text(f"You selected thumbnail {thumbnail_index+1}. Now, please send me the URL you want to link to.")
+        return WAITING_FOR_URL
+    else:
+        debug_log(f"Invalid thumbnail index: {thumbnail_index}")
+        await query.edit_message_text("Invalid thumbnail selection. Please try again.")
+        return ConversationHandler.END
 
-# Main function to run the bot
+async def process_custom_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process custom thumbnail position input."""
+    # Check if user is admin
+    if not await check_admin(update):
+        return ConversationHandler.END
+    
+    user_id = update.effective_user.id
+    position_text = update.message.text.strip()
+    debug_log(f"Custom thumbnail position request: {position_text}")
+    
+    if user_id not in user_data or 'video_path' not in user_data[user_id]:
+        debug_log(f"No active video session for user {user_id}")
+        await update.message.reply_text("Sorry, there was an error. Please start over by sending a video.")
+        return ConversationHandler.END
+    
+    try:
+        # Parse the position
+        position_text = position_text.replace('%', '')
+        position = float(position_text) / 100.0
+        
+        if position < 0 or position > 1:
+            debug_log(f"Invalid position value: {position}")
+            await update.message.reply_text("Position must be between 0 and 100%. Please try again.")
+            return WAITING_FOR_THUMBNAIL_SELECTION
+        
+        # Generate the custom thumbnail
+        custom_thumbnail_path = os.path.join(TEMP_FOLDER, f"{user_id}_custom_thumbnail.jpg")
+        debug_log(f"Extracting custom thumbnail at position {position*100:.0f}%")
+        success = extract_thumbnail(user_data[user_id]['video_path'], custom_thumbnail_path, position)
+        
+        if success:
+            # Save the thumbnail path
+            user_data[user_id]['thumbnail_path'] = custom_thumbnail_path
+            if 'thumbnails' not in user_data[user_id]:
+                user_data[user_id]['thumbnails'] = []
+            user_data[user_id]['thumbnails'].append(custom_thumbnail_path)
+            save_session()
+            
+            debug_log(f"Custom thumbnail extracted successfully to {custom_thumbnail_path}")
+            
+            # Show the custom thumbnail
+            with open(custom_thumbnail_path, 'rb') as thumb_file:
+                await update.message.reply_photo(
+                    photo=thumb_file,
+                    caption=f"Custom thumbnail from position {position*100:.0f}%"
+                )
+            
+            await update.message.reply_text("Now, please send me the URL you want to link to.")
+            return WAITING_FOR_URL
+        else:
+            debug_log("Failed to extract custom thumbnail")
+            await update.message.reply_text("Sorry, I couldn't generate a thumbnail at that position. Please try a different position.")
+            return WAITING_FOR_THUMBNAIL_SELECTION
+            
+    except ValueError:
+        debug_log(f"Invalid number format: {position_text}")
+        await update.message.reply_text("Please enter a valid number between 0 and 100.")
+        return WAITING_FOR_THUMBNAIL_SELECTION
+    except Exception as e:
+        logger.error(f"Error creating custom thumbnail: {e}")
+        debug_log(f"Exception in process_custom_thumbnail: {str(e)}")
+        await update.message.reply_text("Sorry, there was an error creating your custom thumbnail. Please try again.")
+        return WAITING_FOR_THUMBNAIL_SELECTION
+
+async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process the URL provided by the user."""
+    # Check if user is admin
+    if not await check_admin(update):
+        return ConversationHandler.END
+    
+    user_id = update.effective_user.id
+    url = update.message.text.strip()
+    debug_log(f"URL received from user {user_id}: {url}")
+    
+    if user_id not in user_data:
+        debug_log(f"No active session for user {user_id}")
+        await update.message.reply_text("Sorry, there was an error. Please start over by sending a video.")
+        return ConversationHandler.END
+    
+    # Save the URL
+    user_data[user_id]['url'] = url
+    save_session()
+    
+    # Ask for caption
+    await update.message.reply_text(
+        "Thanks! Now, please send me the caption you want to display under the thumbnail."
+    )
+    return WAITING_FOR_CAPTION
+
+async def process_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Process the caption and ask for channel selection."""
+    # Check if user is admin
+    if not await check_admin(update):
+        return ConversationHandler.END
+    
+    user_id = update.effective_user.id
+    caption = update.message.text
+    debug_log(f"Caption received from user {user_id}: {caption[:30]}...")
+    
+    if user_id not in user_data:
+        debug_log(f"No active session for user {user_id}")
+        await update.message.reply_text("Sorry, there was an error. Please start over by sending a video.")
+        return ConversationHandler.END
+    
+    # Save the caption
+    user_data[user_id]['caption'] = caption
+    save_session()
+    
+    # Ask for channel selection
+    keyboard = [
+        [
+            InlineKeyboardButton("🎬 MOVIES Channel", callback_data=CALLBACK_MOVIES),
+            InlineKeyboardButton("📦 STUFF Channel", callback_data=CALLBACK_STUFF)
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    await update.message.reply_text(
+        "Great! Now please select which channel to post this to:",
+        reply_markup=reply_markup
+    )
+    return WAITING_FOR_CHANNEL_SELECTION
+
+async def select_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle channel selection."""
+    query = update.callback_query
+    await query.answer()
+    
+    user_id = query.from_user.id
+    debug_log(f"Channel selection callback from user {user_id}: {query.data}")
+    
+    # Check if user is admin
+    if user_id != ADMIN_USER_ID:
+        debug_log(f"Unauthorized user {user_id} attempted to select channel")
+        await query.edit_message_text("You're not authorized to use this bot.")
+        return ConversationHandler.END
+    
+    if user_id not in user_data:
+        debug_log(f"No active session for user {user_id}")
+        await query.edit_message_text("Sorry, there was an error. Please start over by sending a video.")
+        return ConversationHandler.END
+    
+    # Determine which channel to post to
+    if query.data == CALLBACK_MOVIES:
+        channel = MOVIES_CHANNEL
+        channel_name = "MOVIES"
+    elif query.data == CALLBACK_STUFF:
+        channel = STUFF_CHANNEL
+        channel_name = "STUFF"
+    else:
+        debug_log(f"Invalid channel selection: {query.data}")
+        await query.edit_message_text("Invalid channel selection. Please try again.")
+        return ConversationHandler.END
+    
+    # Store the channel for this post
+    user_data[user_id]['channel'] = channel
+    user_data[user_id]['channel_name'] = channel_name
+    save_session()
+    
+    debug_log(f"User selected {channel_name} channel")
+    
+    # Send confirmation and begin posting process
+    await query.edit_message_text(f"You've selected the {channel_name} channel. Now posting...")
+    
+    # Call the function to post to the channel
+    success = await post_to_channel(user_id, context)
+    
+    if success:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"✅ Successfully posted to {channel_name} channel!"
+        )
+    else:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=f"❌ Failed to post to {channel_name} channel. Please try again."
+        )
+    
+    # Cleanup and end the conversation
+    cleanup_user_files(user_id)
+    return ConversationHandler.END
+
+async def post_to_channel(user_id: int, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Post the thumbnail with caption and URL to the specified channel."""
+    debug_log(f"Posting to channel for user {user_id}")
+    
+    if user_id not in user_data:
+        debug_log(f"No data found for user {user_id}")
+        return False
+    
+    try:
+        # Get the user data
+        channel = user_data[user_id]['channel']
+        url = user_data[user_id]['url']
+        caption = user_data[user_id]['caption']
+        thumbnail_path = user_data[user_id]['thumbnail_path']
+        channel_name = user_data[user_id]['channel_name']
+        
+        debug_log(f"Posting to {channel_name} channel ({channel})")
+        
+        # Create buttons for the post
+        keyboard = []
+        
+        # Add URL button
+        keyboard.append([InlineKeyboardButton("Download / Watch", url=url)])
+        
+        # Add the join channel button
+        clean_channel = channel.replace("@", "")
+        keyboard.append([InlineKeyboardButton(f"Join Our {channel_name} Channel", url=f"https://t.me/{clean_channel}")])
+        
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        # Send the post
+        with open(thumbnail_path, 'rb') as thumb_file:
+            debug_log(f"Sending photo to {channel} with caption: {caption[:30]}...")
+            await context.bot.send_photo(
+                chat_id=channel,
+                photo=thumb_file,
+                caption=caption,
+                reply_markup=reply_markup
+            )
+        
+        # Add to post history
+        add_to_post_history(channel, caption, url, thumbnail_path)
+        debug_log("Post sent successfully")
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error posting to channel: {e}")
+        debug_log(f"Exception in post_to_channel: {str(e)}")
+        return False
+
+def cleanup_user_files(user_id: int) -> None:
+    """Clean up files for the user but keep the necessary ones for history."""
+    debug_log(f"Cleaning up files for user {user_id}")
+    
+    if user_id not in user_data:
+        debug_log(f"No data to clean up for user {user_id}")
+        return
+    
+    # Clean up files except the selected thumbnail (which will be kept for history)
+    thumbnail_to_keep = user_data[user_id].get('thumbnail_path')
+    
+    # Remove video file
+    if 'video_path' in user_data[user_id]:
+        try_delete_file(user_data[user_id]['video_path'])
+    
+    # Remove other thumbnails
+    if 'thumbnails' in user_data[user_id]:
+        for thumb_path in user_data[user_id]['thumbnails']:
+            # Skip the selected thumbnail
+            if thumb_path == thumbnail_to_keep:
+                continue
+            try_delete_file(thumb_path)
+    
+    # Remove the user data
+    del user_data[user_id]
+    save_session()
+    debug_log(f"Cleanup completed for user {user_id}")
+
+def try_delete_file(file_path: str) -> bool:
+    """Try to delete a file, return True if successful, False otherwise."""
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+            debug_log(f"Deleted file: {file_path}")
+            return True
+        return False
+    except Exception as e:
+        logger.error(f"Error deleting file {file_path}: {e}")
+        debug_log(f"Failed to delete file: {file_path}, Error: {str(e)}")
+        return False
+
+def extract_thumbnail(video_path: str, thumbnail_path: str, position: float = 0.5) -> bool:
+    """
+    Extract a thumbnail from the video at the specified position.
+    
+    Args:
+        video_path: Path to the video file
+        thumbnail_path: Path where the thumbnail should be saved
+        position: Position in the video (0.0 to 1.0) where to extract the thumbnail
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        debug_log(f"Extracting thumbnail from {video_path} at position {position}")
+        
+        # Open the video file
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            logger.error(f"Could not open video file: {video_path}")
+            return False
+        
+        # Get total number of frames
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        # Calculate frame position
+        frame_position = int(total_frames * position)
+        
+        # Set the position
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_position)
+        
+        # Read the frame
+        ret, frame = cap.read()
+        if not ret:
+            logger.error(f"Could not read frame at position {position}")
+            cap.release()
+            return False
+        
+        # Save the frame as an image
+        cv2.imwrite(thumbnail_path, frame)
+        
+        # Release the video file
+        cap.release()
+        
+        return os.path.exists(thumbnail_path)
+    except Exception as e:
+        logger.error(f"Error extracting thumbnail: {e}")
+        debug_log(f"Exception in extract_thumbnail: {str(e)}")
+        return False
+
 def main() -> None:
-    # Create the Application
-    application = Application.builder().token(BOT_TOKEN).build()
+    """Run the bot."""
+    # Load session data
+    load_session()
+    
+    # Load post history
+    load_post_history()
+    
+    # Create the Application and pass it your bot's token
+    application = ApplicationBuilder().token(TOKEN).build()
+    
+    # Add conversation handler for video processing
+    conv_handler = ConversationHandler(
+        entry_points=[
+            CommandHandler('start', start),
+            MessageHandler(filters.VIDEO, process_video)
+        ],
+        states={
+            WAITING_FOR_THUMBNAIL_SELECTION: [
+                CallbackQueryHandler(select_thumbnail, pattern=f"^{CALLBACK_THUMBNAIL_START}"),
+                CallbackQueryHandler(select_thumbnail, pattern=f"^{CALLBACK_THUMBNAIL_CUSTOM}$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_custom_thumbnail)
+            ],
+            WAITING_FOR_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_url)
+            ],
+            WAITING_FOR_CAPTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_caption)
+            ],
+            WAITING_FOR_CHANNEL_SELECTION: [
+                CallbackQueryHandler(select_channel, pattern=f"^{CALLBACK_MOVIES}$|^{CALLBACK_STUFF}$")
+            ],
+            WAITING_FOR_BROADCAST_MESSAGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_broadcast_message)
+            ]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
+    
+    # Add conversation handler for broadcast messages
+    broadcast_handler = ConversationHandler(
+        entry_points=[CommandHandler('broadcast', broadcast_command)],
+        states={
+            WAITING_FOR_BROADCAST_MESSAGE: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_broadcast_message)
+            ]
+        },
+        fallbacks=[CommandHandler('cancel', cancel)]
+    )
     
     # Add command handlers
-    application.add_handler(CommandHandler("start", start))
-    application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("stats", stats_command))
-    application.add_handler(CommandHandler("broadcast", broadcast_command))
-    application.add_handler(CommandHandler("forward", forward_to_dump))
-    
-    # Add message handler
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    
-    # Add error handler
-    application.add_error_handler(error_handler)
+    application.add_handler(conv_handler)
+    application.add_handler(broadcast_handler)
+    application.add_handler(CommandHandler('help', help_command))
+    application.add_handler(CommandHandler('cancel', cancel))
+    application.add_handler(CommandHandler('debug', toggle_debug))
+    application.add_handler(CommandHandler('autostart', toggle_autostart))
+    application.add_handler(CommandHandler('status', status_command))
+    application.add_handler(CommandHandler('posts', posts_command))
+    application.add_handler(CommandHandler('cleanup', cleanup_command))
     
     # Start the Bot
-    if WEBHOOK_URL:
-        try:
-            logger.info(f"Starting webhook on port {PORT}")
-            application.run_webhook(
-                listen="0.0.0.0",
-                port=PORT,
-                url_path=BOT_TOKEN,
-                webhook_url=f"{WEBHOOK_URL}/{BOT_TOKEN}"
-            )
-        except RuntimeError as e:
-            logger.error(f"Failed to start webhook: {e}")
-            logger.info("Falling back to polling mode")
-            application.run_polling()
-    else:
-        logger.info("Starting bot in polling mode")
-        application.run_polling()
+    logger.info("Starting bot...")
+    application.run_polling()
 
-if __name__ == "__main__":
-    # Start flask app in a separate thread for health checks
-    import threading
-    threading.Thread(target=lambda: app.run(host='0.0.0.0', port=int(os.getenv('FLASK_PORT', 8080)), debug=False)).start()
-    
-    # Start the main bot
+if __name__ == '__main__':
     main()
