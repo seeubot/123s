@@ -15,7 +15,7 @@ class ThumbnailGenerator {
     }
   }
 
-  // Main method to generate thumbnails with enhanced error handling and retries
+  // Main method to generate thumbnails
   async generateThumbnails(fileUrl, videoInfo) {
     console.log('Starting thumbnail generation process');
     
@@ -26,33 +26,29 @@ class ThumbnailGenerator {
         console.log('Retrieved video metadata:', videoInfo);
       }
       
-      // Try each method with retries
-      // Method 1: Direct ffmpeg frame extraction (with retries)
-      let thumbnails = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        console.log(`Attempt ${attempt} using direct extraction method`);
-        thumbnails = await this.generateDirectThumbnails(fileUrl, videoInfo);
-        if (thumbnails && thumbnails.length > 0) {
-          console.log(`Direct extraction succeeded on attempt ${attempt}`);
-          return thumbnails;
-        }
-      }
-      
-      // Method 2: Try to extract embedded thumbnail
-      console.log('Direct approach failed, trying to extract embedded thumbnail');
-      const embeddedThumbnail = await this.extractEmbeddedThumbnail(fileUrl);
+      // Method 1: Try extract embedded thumbnail with proper conversion
+      console.log('Trying to extract embedded thumbnail with format conversion');
+      const embeddedThumbnail = await this.extractEmbeddedThumbnailWithConversion(fileUrl);
       
       if (embeddedThumbnail) {
-        console.log('Successfully extracted embedded thumbnail');
+        console.log('Successfully extracted and converted embedded thumbnail');
         return [embeddedThumbnail];
       }
       
-      // Method 3: Use multiple screenshot methods with different configurations
-      console.log('Trying alternative screenshot approaches');
-      thumbnails = await this.generateMultipleScreenshots(fileUrl, videoInfo);
+      // Method 2: Try to generate thumbnails with improved approach
+      console.log('Trying thumbnails with improved method');
+      const thumbnails = await this.generateImprovedThumbnails(fileUrl, videoInfo);
       
       if (thumbnails && thumbnails.length > 0) {
         return thumbnails;
+      }
+      
+      // Method 3: Create a blank thumbnail with text as fallback
+      console.log('All thumbnail methods failed, creating fallback thumbnail');
+      const fallbackThumbnail = await this.createFallbackThumbnail(videoInfo);
+      
+      if (fallbackThumbnail) {
+        return [fallbackThumbnail];
       }
       
       // If we reach here, all methods failed
@@ -77,7 +73,12 @@ class ThumbnailGenerator {
           fileUrl
         ];
         
-        const ffprobeProcess = spawn(ffmpegPath.replace('ffmpeg', 'ffprobe'), ffprobeArgs);
+        // Use ffprobe if available, otherwise use ffmpeg
+        const probePath = ffmpegPath.replace('ffmpeg', 'ffprobe');
+        const ffprobeProcess = spawn(
+          fs.existsSync(probePath) ? probePath : ffmpegPath, 
+          ffprobeArgs
+        );
         
         let outputData = '';
         let errorData = '';
@@ -122,202 +123,190 @@ class ThumbnailGenerator {
     }
   }
   
-  // Direct ffmpeg execution with memory optimization
-  async generateDirectThumbnails(fileUrl, videoInfo) {
-    const { duration } = videoInfo;
-    const timestamps = this._getTimestamps(duration);
-    const thumbnails = [];
-    
-    // Try to generate thumbnails at different timestamps
-    const limitedTimestamps = timestamps.slice(0, 3);
-    
-    for (const timestamp of limitedTimestamps) {
-      const thumbnailPath = path.join(this.tempDir, `thumbnail-${uuidv4()}.jpg`);
-      
-      try {
-        // Try with different quality settings
-        const configs = [
-          // Config 1: Lower resolution
-          {
-            args: [
-              '-y',
-              '-ss', timestamp.toString(),
-              '-i', fileUrl,
-              '-vframes', '1',
-              '-vf', 'scale=240:-1',
-              '-q:v', '5',
-              thumbnailPath
-            ],
-            timeout: 30000
-          },
-          // Config 2: Higher quality settings
-          {
-            args: [
-              '-y',
-              '-ss', timestamp.toString(),
-              '-i', fileUrl,
-              '-vframes', '1',
-              '-q:v', '2',
-              thumbnailPath
-            ],
-            timeout: 30000
-          }
-        ];
-        
-        // Try different configurations until one works
-        for (const config of configs) {
-          try {
-            await this._runFfmpegCommand(config.args, config.timeout);
-            
-            // Verify the thumbnail was created and is valid
-            if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 100) {
-              thumbnails.push(thumbnailPath);
-              console.log(`Successfully generated thumbnail at ${timestamp}`);
-              break; // Success, break out of configuration loop
-            }
-          } catch (configError) {
-            console.log(`Config failed for timestamp ${timestamp}:`, configError.message);
-            // Continue to next config
-          }
-        }
-      } catch (error) {
-        console.error(`Error generating thumbnail at ${timestamp}:`, error);
-        // Continue to next timestamp
-      }
-    }
-    
-    return thumbnails;
-  }
-  
-  // Try to extract embedded thumbnail if the video has one
-  async extractEmbeddedThumbnail(fileUrl) {
+  // Extract embedded thumbnail with conversion to make it Telegram-compatible
+  async extractEmbeddedThumbnailWithConversion(fileUrl) {
     try {
-      const thumbnailPath = path.join(this.tempDir, `embedded-thumbnail-${uuidv4()}.jpg`);
+      const rawThumbnailPath = path.join(this.tempDir, `raw-thumbnail-${uuidv4()}.jpg`);
+      const convertedThumbnailPath = path.join(this.tempDir, `converted-thumbnail-${uuidv4()}.jpg`);
       
-      // Try two different methods for extracting embedded thumbnails
-      const methods = [
-        // Method 1: Copy first video frame
-        {
-          args: [
+      // Step 1: Try to extract the embedded thumbnail
+      try {
+        await this._runFfmpegCommand([
+          '-i', fileUrl,
+          '-map', '0:v:0',
+          '-map', '-0:a',
+          '-c', 'copy',
+          '-frames:v', '1',
+          rawThumbnailPath
+        ], 15000);
+        
+        // Check if thumbnail was extracted
+        if (!fs.existsSync(rawThumbnailPath) || fs.statSync(rawThumbnailPath).size < 100) {
+          console.log('No valid embedded thumbnail found, trying alternative method');
+          
+          // Try alternative methods for extraction
+          await this._runFfmpegCommand([
             '-i', fileUrl,
-            '-map', '0:v:0',
-            '-map', '-0:a',
-            '-c', 'copy',
-            '-frames:v', '1',
-            thumbnailPath
-          ],
-          timeout: 15000
-        },
-        // Method 2: Extract album art/cover
-        {
-          args: [
-            '-i', fileUrl,
-            '-an',
+            '-an',  // No audio
             '-vcodec', 'copy',
             '-y',
-            thumbnailPath
-          ],
-          timeout: 15000
+            rawThumbnailPath
+          ], 15000);
         }
-      ];
-      
-      for (const method of methods) {
-        try {
-          await this._runFfmpegCommand(method.args, method.timeout);
+        
+        // Check again if we have a valid file
+        if (fs.existsSync(rawThumbnailPath) && fs.statSync(rawThumbnailPath).size > 100) {
+          // Step 2: Convert the thumbnail to a format Telegram can handle (JPEG)
+          await this._runFfmpegCommand([
+            '-i', rawThumbnailPath,
+            '-vf', 'scale=320:-1', // Resize to reasonable size
+            '-q:v', '2',           // High quality
+            '-f', 'image2',        // Force image format
+            '-vcodec', 'mjpeg',    // Use MJPEG codec (more compatible)
+            convertedThumbnailPath
+          ], 10000);
           
-          if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 100) {
-            console.log('Successfully extracted embedded thumbnail');
-            return thumbnailPath;
+          // Clean up the raw thumbnail
+          try {
+            if (fs.existsSync(rawThumbnailPath)) {
+              fs.unlinkSync(rawThumbnailPath);
+            }
+          } catch (e) {
+            console.error('Error cleaning up raw thumbnail:', e);
           }
-        } catch (methodError) {
-          console.log(`Embedded thumbnail method failed:`, methodError.message);
-          // Continue to next method
+          
+          // Check if conversion succeeded
+          if (fs.existsSync(convertedThumbnailPath) && fs.statSync(convertedThumbnailPath).size > 100) {
+            return convertedThumbnailPath;
+          }
         }
+      } catch (extractError) {
+        console.error('Error extracting or converting embedded thumbnail:', extractError);
+        // Clean up any partial files
+        this.cleanupThumbnails([rawThumbnailPath, convertedThumbnailPath]);
       }
       
-      console.log('No embedded thumbnail found');
       return null;
     } catch (error) {
-      console.error('Error extracting embedded thumbnail:', error);
+      console.error('Error in extractEmbeddedThumbnailWithConversion:', error);
       return null;
     }
   }
   
-  // Generate multiple screenshots with different approaches
-  async generateMultipleScreenshots(fileUrl, videoInfo) {
-    const { duration } = videoInfo;
+  // Generate thumbnails with improved approach to work with Telegram
+  async generateImprovedThumbnails(fileUrl, videoInfo) {
+    const { duration } = videoInfo || { duration: 10 };
     const thumbnails = [];
     
-    // Try multiple timestamps and configurations
-    const timestamps = [
-      Math.max(1, Math.min(duration * 0.1, 3)),       // Near start
-      Math.max(1, Math.min(duration * 0.2, 5)),       // Early
-      Math.max(1, Math.min(duration * 0.5, duration * 0.5))  // Middle
+    // Try different positions in the video
+    const positions = [
+      Math.min(1, duration * 0.1),      // Near start but avoid potential black frames
+      Math.max(2, duration * 0.25),     // 1/4 through
+      Math.max(3, duration * 0.5)       // Middle
     ];
     
-    for (const timestamp of timestamps) {
-      const thumbnailPath = path.join(this.tempDir, `minimal-thumbnail-${uuidv4()}.jpg`);
+    for (const position of positions) {
+      const thumbnailPath = path.join(this.tempDir, `improved-thumbnail-${uuidv4()}.jpg`);
       
-      const configs = [
-        // Config 1: Very minimal
-        {
-          args: [
-            '-ss', timestamp.toString(),
-            '-i', fileUrl,
-            '-frames:v', '1',
-            '-vf', 'scale=160:-1',
-            '-q:v', '10',
-            thumbnailPath
-          ],
-          timeout: 10000
-        },
-        // Config 2: Input first, then seek (sometimes more reliable)
-        {
-          args: [
-            '-i', fileUrl,
-            '-ss', timestamp.toString(),
-            '-frames:v', '1',
-            '-vf', 'scale=240:-1',
-            '-q:v', '5',
-            thumbnailPath
-          ],
-          timeout: 15000
-        },
-        // Config 3: Stream copy
-        {
-          args: [
-            '-ss', timestamp.toString(),
-            '-i', fileUrl,
-            '-frames:v', '1',
-            '-c:v', 'mjpeg',
-            '-f', 'image2',
-            thumbnailPath
-          ],
-          timeout: 15000
-        }
-      ];
-      
-      for (const config of configs) {
-        try {
-          await this._runFfmpegCommand(config.args, config.timeout);
-          
-          if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 100) {
-            thumbnails.push(thumbnailPath);
-            console.log(`Successfully generated minimal screenshot at ${timestamp}`);
-            break; // Success, break out of configuration loop
+      try {
+        // Use a more robust approach - seek first, then input
+        await this._runFfmpegCommand([
+          '-ss', position.toString(),   // Seek before input for better accuracy
+          '-i', fileUrl,                // Video file
+          '-vframes', '1',              // Single frame
+          '-vf', 'scale=320:-1',        // Scale to 320px width
+          '-f', 'image2',               // Force image output
+          '-q:v', '2',                  // High quality
+          thumbnailPath                 // Output path
+        ], 30000);
+        
+        // Verify and test if the created thumbnail is valid
+        if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 100) {
+          // Additional validation to ensure it's a valid image
+          try {
+            // Try to re-encode it to confirm it's a valid image
+            const validationPath = path.join(this.tempDir, `validation-${uuidv4()}.jpg`);
+            
+            await this._runFfmpegCommand([
+              '-i', thumbnailPath,
+              '-f', 'image2',
+              validationPath
+            ], 5000);
+            
+            // If validation passes, use this thumbnail
+            if (fs.existsSync(validationPath) && fs.statSync(validationPath).size > 100) {
+              // Use the validated image instead
+              thumbnails.push(validationPath);
+              
+              // Clean up original
+              this.cleanupThumbnails([thumbnailPath]);
+              console.log(`Successfully generated validated thumbnail at position ${position}`);
+              
+              // Break after one successful thumbnail
+              break;
+            } else {
+              console.log(`Generated thumbnail failed validation, trying next position`);
+              this.cleanupThumbnails([thumbnailPath, validationPath]);
+            }
+          } catch (validationError) {
+            console.error(`Thumbnail validation failed:`, validationError);
+            this.cleanupThumbnails([thumbnailPath]);
           }
-        } catch (configError) {
-          // Just continue to next config
+        } else {
+          console.log(`Generated thumbnail was invalid, trying next position`);
+          this.cleanupThumbnails([thumbnailPath]);
         }
-      }
-      
-      // If we got a thumbnail, we can stop trying
-      if (thumbnails.length > 0) {
-        break;
+      } catch (error) {
+        console.error(`Error generating thumbnail at position ${position}:`, error);
+        this.cleanupThumbnails([thumbnailPath]);
       }
     }
     
     return thumbnails;
+  }
+  
+  // Create a simple fallback thumbnail with text
+  async createFallbackThumbnail(videoInfo) {
+    try {
+      const { duration } = videoInfo || { duration: 0 };
+      const thumbnailPath = path.join(this.tempDir, `fallback-thumbnail-${uuidv4()}.jpg`);
+      
+      // Create a thumbnail with duration info
+      const durationText = duration > 0 ? `Duration: ${Math.floor(duration / 60)}:${Math.floor(duration % 60).toString().padStart(2, '0')}` : 'Video';
+      
+      // Generate image with text
+      await this._runFfmpegCommand([
+        '-f', 'lavfi',
+        '-i', `color=c=black:s=320x240`,
+        '-vf', `drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf:text='${durationText}':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=(h-text_h)/2`,
+        '-frames:v', '1',
+        thumbnailPath
+      ], 10000);
+      
+      if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 100) {
+        console.log('Created fallback thumbnail with text');
+        return thumbnailPath;
+      }
+      
+      // If text overlay fails, try just a simple color
+      console.log('Text overlay failed, creating simple color thumbnail');
+      await this._runFfmpegCommand([
+        '-f', 'lavfi',
+        '-i', 'color=c=blue:s=320x240',
+        '-frames:v', '1',
+        thumbnailPath
+      ], 5000);
+      
+      if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 100) {
+        console.log('Created simple color thumbnail');
+        return thumbnailPath;
+      }
+      
+      return null;
+    } catch (error) {
+      console.error('Error creating fallback thumbnail:', error);
+      return null;
+    }
   }
   
   // Helper method to run ffmpeg with proper error handling and timeouts
@@ -325,11 +314,11 @@ class ThumbnailGenerator {
     return new Promise((resolve, reject) => {
       console.log(`Running ffmpeg with args: ${args.join(' ')}`);
       
-      // Set conservative memory limits and optimize for speed
+      // Set conservative memory limits
       const ffmpegProcess = spawn(ffmpegPath, [
-        '-hide_banner',       // Hide ffmpeg banner
-        '-threads', '1',      // Use only one thread
-        '-loglevel', 'error', // Only show errors in logs
+        '-hide_banner',         // Hide ffmpeg banner
+        '-threads', '1',        // Use only one thread
+        '-loglevel', 'error',   // Only show errors in logs
         ...args
       ]);
       
@@ -379,109 +368,12 @@ class ThumbnailGenerator {
     });
   }
   
-  // Download thumbnail manually from Telegram with enhanced reliability
-  async downloadThumbnailFromTelegram(fileId, botToken) {
-    try {
-      // Get file info from Telegram with retry
-      let response = null;
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          response = await axios.get(`https://api.telegram.org/bot${botToken}/getFile?file_id=${fileId}`, {
-            timeout: 10000
-          });
-          if (response.data && response.data.ok) {
-            break;
-          }
-        } catch (retryError) {
-          console.log(`Telegram API retry ${attempt} failed:`, retryError.message);
-          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between retries
-        }
-      }
-      
-      if (!response || !response.data || !response.data.ok || !response.data.result) {
-        console.error('Invalid response from Telegram getFile:', response?.data);
-        return null;
-      }
-      
-      const filePath = response.data.result.file_path;
-      const fileUrl = `https://api.telegram.org/file/bot${botToken}/${filePath}`;
-      
-      // Download the thumbnail with retry
-      const thumbnailPath = path.join(this.tempDir, `telegram-thumbnail-${uuidv4()}.jpg`);
-      
-      for (let attempt = 1; attempt <= 3; attempt++) {
-        try {
-          const writer = fs.createWriteStream(thumbnailPath);
-          
-          const downloadResponse = await axios({
-            method: 'GET',
-            url: fileUrl,
-            responseType: 'stream',
-            timeout: 15000
-          });
-          
-          downloadResponse.data.pipe(writer);
-          
-          await new Promise((resolve, reject) => {
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-          });
-          
-          // Verify file was created successfully
-          if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 100) {
-            console.log('Successfully downloaded thumbnail from Telegram');
-            return thumbnailPath;
-          }
-          
-          console.log(`Downloaded file is invalid on attempt ${attempt}`);
-          
-          // Clean up failed download
-          if (fs.existsSync(thumbnailPath)) {
-            fs.unlinkSync(thumbnailPath);
-          }
-        } catch (downloadError) {
-          console.error(`Error downloading thumbnail on attempt ${attempt}:`, downloadError.message);
-          
-          // Clean up failed download
-          if (fs.existsSync(thumbnailPath)) {
-            fs.unlinkSync(thumbnailPath);
-          }
-          
-          await new Promise(resolve => setTimeout(resolve, 1000)); // Wait 1 second between retries
-        }
-      }
-      
-      console.log('All download attempts failed');
-      return null;
-    } catch (error) {
-      console.error('Error in downloadThumbnailFromTelegram:', error);
-      return null;
-    }
-  }
-  
-  // Helper function to get timestamps that are well-distributed
-  _getTimestamps(duration) {
-    // If duration is 0 or invalid, use default values
-    if (!duration || duration <= 0) {
-      return [0, 5, 10];
-    }
-    
-    // More timestamps at different positions for better chances of success
-    return [
-      Math.min(1, duration * 0.05),            // Very start
-      Math.min(3, duration * 0.1),             // Near start
-      Math.min(duration * 0.25, duration / 4), // First quarter
-      Math.min(duration * 0.5, duration / 2),  // Middle
-      Math.max(duration * 0.8, duration - 5)   // Near end
-    ];
-  }
-  
   // Clean up thumbnail files
   cleanupThumbnails(thumbnailPaths) {
     if (!thumbnailPaths) return;
     
     thumbnailPaths.forEach(path => {
-      if (fs.existsSync(path)) {
+      if (path && fs.existsSync(path)) {
         try {
           fs.unlinkSync(path);
         } catch (err) {
@@ -489,30 +381,6 @@ class ThumbnailGenerator {
         }
       }
     });
-  }
-  
-  // Utility method to create a simple blank thumbnail as last resort
-  async createBlankThumbnail(width = 320, height = 240) {
-    try {
-      const thumbnailPath = path.join(this.tempDir, `blank-thumbnail-${uuidv4()}.jpg`);
-      
-      await this._runFfmpegCommand([
-        '-f', 'lavfi',
-        '-i', `color=c=black:s=${width}x${height}`,
-        '-frames:v', '1',
-        thumbnailPath
-      ], 5000);
-      
-      if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 0) {
-        console.log('Created blank thumbnail as fallback');
-        return thumbnailPath;
-      }
-      
-      return null;
-    } catch (error) {
-      console.error('Error creating blank thumbnail:', error);
-      return null;
-    }
   }
 }
 
