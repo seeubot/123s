@@ -4,13 +4,28 @@ const path = require('path');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 const http = require('http');
+const mongoose = require('mongoose');
+const rateLimit = require('telegraf-ratelimit');
 
 // Import our modules
 const ThumbnailGenerator = require('./thumbnailGenerator');
 const FallbackHandler = require('./fallbackHandler');
+const { UserState } = require('./models/userState');
+const { logActivity, logError } = require('./utils/logger');
 
-// Get bot token from environment variable or use default
-const BOT_TOKEN = process.env.BOT_TOKEN || '6866329408:AAE7bPEHzZQf2Dh6ccidxxJsWtD-Qj6GKdo';
+// Environment variables check
+if (!process.env.BOT_TOKEN) {
+  console.error('ERROR: BOT_TOKEN environment variable is not set!');
+  process.exit(1);
+}
+
+if (!process.env.MONGODB_URI) {
+  console.error('ERROR: MONGODB_URI environment variable is not set!');
+  process.exit(1);
+}
+
+// Get bot token from environment variable
+const BOT_TOKEN = process.env.BOT_TOKEN;
 
 // Set your channel IDs here
 const CHANNELS = {
@@ -21,11 +36,11 @@ const CHANNELS = {
 // List of admin user IDs who can use the bot
 const ADMIN_IDS = [
   1352497419,
-  1352497419
+  // Add additional admin IDs here
 ];
 
-// Debug token to verify it's in the correct format
-console.log(`Token starting with: ${BOT_TOKEN.substring(0, 5)}... (length: ${BOT_TOKEN.length})`);
+// Debug token length without revealing contents
+console.log(`Token configuration verified (length: ${BOT_TOKEN.length})`);
 
 // Initialize the bot
 const bot = new Telegraf(BOT_TOKEN);
@@ -43,15 +58,37 @@ if (!fs.existsSync(tempDir)) {
   fs.mkdirSync(tempDir, { recursive: true });
 }
 
-// Keep track of user states
-const userStates = {};
+// Connect to MongoDB
+mongoose.connect(process.env.MONGODB_URI, {
+  useNewUrlParser: true,
+  useUnifiedTopology: true
+}).then(() => {
+  console.log('Connected to MongoDB');
+}).catch(err => {
+  console.error('Failed to connect to MongoDB:', err);
+  process.exit(1);
+});
+
+// Add rate limiting middleware
+const limitConfig = {
+  window: 5000, // 5 seconds
+  limit: 3, // 3 messages per window
+  onLimitExceeded: (ctx) => ctx.reply('Please slow down! You\'re sending messages too quickly.')
+};
+
+bot.use(rateLimit(limitConfig));
 
 // Admin check middleware
-const adminCheckMiddleware = (ctx, next) => {
+const adminCheckMiddleware = async (ctx, next) => {
   const userId = ctx.from.id;
+  
+  // Log all attempted access
+  logActivity(`Access attempt by user ${userId} (${ctx.from.username || 'no username'})`);
+  
   if (ADMIN_IDS.includes(userId)) {
     return next();
   } else {
+    logActivity(`Unauthorized access attempt by user ${userId}`);
     return ctx.reply('Sorry, this bot is only available to administrators.');
   }
 };
@@ -59,10 +96,10 @@ const adminCheckMiddleware = (ctx, next) => {
 // Basic commands
 bot.start((ctx) => {
   try {
-    console.log(`User ${ctx.from.id} (${ctx.from.username || 'no username'}) started the bot`);
+    logActivity(`User ${ctx.from.id} (${ctx.from.username || 'no username'}) started the bot`);
     ctx.reply('Welcome to Admin Thumbnail Generator Bot! Send me a video file (up to 1GB), and I\'ll generate thumbnails for you.');
   } catch (error) {
-    console.error('Error in start command:', error);
+    logError('Error in start command:', error);
   }
 });
 
@@ -81,29 +118,37 @@ bot.help((ctx) => {
       '/stats - View bot usage statistics'
     );
   } catch (error) {
-    console.error('Error in help command:', error);
+    logError('Error in help command:', error);
   }
 });
 
 // Admin commands
 bot.command('broadcast', adminCheckMiddleware, async (ctx) => {
   try {
-    userStates[ctx.from.id] = {
-      waitingForBroadcastMessage: true
-    };
+    // Store state in database
+    await UserState.findOneAndUpdate(
+      { userId: ctx.from.id },
+      { 
+        userId: ctx.from.id,
+        waitingForBroadcastMessage: true,
+        lastUpdated: new Date()
+      },
+      { upsert: true, new: true }
+    );
     
     ctx.reply('Please send the message you want to broadcast to all channels.');
   } catch (error) {
-    console.error('Error in broadcast command:', error);
+    logError('Error in broadcast command:', error);
     ctx.reply('An error occurred while processing your command. Please try again.');
   }
 });
 
 bot.command('stats', adminCheckMiddleware, async (ctx) => {
   try {
+    // TODO: Pull real statistics from database when implemented
     ctx.reply('Bot Statistics:\n- Active since: Bot start time\n- Videos processed: Count\n- Posts made: Count');
   } catch (error) {
-    console.error('Error in stats command:', error);
+    logError('Error in stats command:', error);
     ctx.reply('An error occurred while processing your command. Please try again.');
   }
 });
@@ -121,47 +166,61 @@ bot.on('video', adminCheckMiddleware, async (ctx) => {
 
     await ctx.reply('Processing your video. This may take a moment...');
 
-    // Store video information
-    userStates[userId] = {
-      video: video,
-      videoId: video.file_id,
-      videoName: video.file_name || 'video.mp4',
-      videoWidth: video.width,
-      videoHeight: video.height,
-      aspectRatio: video.width / video.height,
-      duration: video.duration
-    };
+    // Generate a unique session ID for this processing session
+    const sessionId = uuidv4();
+    
+    // Store video information in database
+    await UserState.findOneAndUpdate(
+      { userId },
+      {
+        userId,
+        sessionId,
+        videoId: video.file_id,
+        videoName: video.file_name || 'video.mp4',
+        videoWidth: video.width,
+        videoHeight: video.height,
+        aspectRatio: (video.width / video.height).toFixed(2),
+        duration: video.duration,
+        lastUpdated: new Date()
+      },
+      { upsert: true, new: true }
+    );
     
     // Process the video
     await processVideoForThumbnails(ctx, userId);
   } catch (error) {
-    console.error('Error handling video:', error);
+    logError('Error handling video:', error);
     ctx.reply('Sorry, there was an error processing your video. Please try again or upload a different video.');
     
     // Clean up
-    cleanupTempFiles(userId);
+    await cleanupTempFiles(ctx.from.id);
   }
 });
 
 // Process videos with improved error handling
 async function processVideoForThumbnails(ctx, userId) {
-  const userState = userStates[userId];
-  const video = userState.video;
-  
+  let userState;
   try {
+    // Get user state from database
+    userState = await UserState.findOne({ userId });
+    
+    if (!userState) {
+      throw new Error('User state not found');
+    }
+    
     await ctx.reply('Analyzing video and preparing thumbnail extraction...');
     
     // Get file info from Telegram
-    const fileInfo = await ctx.telegram.getFile(video.file_id);
+    const fileInfo = await ctx.telegram.getFile(userState.videoId);
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
     
     // Video info for thumbnail generation
     const videoInfo = {
-      duration: video.duration,
-      width: video.width,
-      height: video.height,
-      file_name: video.file_name,
-      file_size: video.file_size
+      duration: userState.duration,
+      width: userState.videoWidth,
+      height: userState.videoHeight,
+      file_name: userState.videoName,
+      file_size: fileInfo.file_size
     };
     
     // Try to generate thumbnails
@@ -169,16 +228,16 @@ async function processVideoForThumbnails(ctx, userId) {
     
     // If thumbnails generation failed completely, try fallbacks
     if (!thumbnails || thumbnails.length === 0) {
-      console.log('Main thumbnail generation failed, trying fallbacks');
+      logActivity('Main thumbnail generation failed, trying fallbacks');
       
       // Try to extract Telegram's own thumbnail first
-      const telegramThumbnail = await fallbackHandler.extractVideoThumbnail(ctx.telegram, video.file_id);
+      const telegramThumbnail = await fallbackHandler.extractVideoThumbnail(ctx.telegram, userState.videoId);
       
       if (telegramThumbnail) {
         thumbnails = [telegramThumbnail];
       } else {
         // Try creating a placeholder as final resort
-        const placeholderThumbnail = await fallbackHandler.generatePlaceholderThumbnail(video.file_name);
+        const placeholderThumbnail = await fallbackHandler.generatePlaceholderThumbnail(userState.videoName);
         
         if (placeholderThumbnail) {
           thumbnails = [placeholderThumbnail];
@@ -187,15 +246,19 @@ async function processVideoForThumbnails(ctx, userId) {
     }
     
     if (thumbnails && thumbnails.length > 0) {
-      // Successfully generated or obtained thumbnails
+      // Store thumbnails paths in database
       userState.thumbnails = thumbnails;
-      userState.waitingForThumbnailSelection = true;
+      userState.waitingForThumbnailSelection = thumbnails.length > 1;
+      
+      await userState.save();
       
       // If only one thumbnail, skip selection
       if (thumbnails.length === 1) {
         userState.selectedThumbnail = thumbnails[0];
         userState.waitingForThumbnailSelection = false;
         userState.waitingForUrl = true;
+        
+        await userState.save();
         
         await ctx.replyWithPhoto(
           { source: thumbnails[0] },
@@ -221,29 +284,31 @@ async function processVideoForThumbnails(ctx, userId) {
       await handleThumbnailGenerationError(ctx, userId);
     }
   } catch (error) {
-    console.error('Error processing video for thumbnails:', error);
+    logError('Error processing video for thumbnails:', error);
     // Ask user for manual thumbnail upload
     await handleThumbnailGenerationError(ctx, userId);
   }
 }
 
 // Handle text messages
-bot.on('text', async (ctx) => {
+bot.on('text', adminCheckMiddleware, async (ctx) => {
   const userId = ctx.from.id;
-  const userState = userStates[userId];
-  
-  // Check if user is in a known state
-  if (!userState && !ADMIN_IDS.includes(userId)) {
-    return ctx.reply('Please use /start to begin using the bot.');
-  }
-  
-  if (!userState) return;
   
   try {
+    // Retrieve user state from database
+    const userState = await UserState.findOne({ userId });
+    
+    if (!userState) {
+      return ctx.reply('Please use /start to begin using the bot.');
+    }
+    
     // Handle broadcast message
     if (userState.waitingForBroadcastMessage) {
       const broadcastMessage = ctx.message.text;
+      
+      // Update user state
       userState.waitingForBroadcastMessage = false;
+      await userState.save();
       
       ctx.reply('Broadcasting message to all channels...');
       
@@ -254,8 +319,9 @@ bot.on('text', async (ctx) => {
             channelId,
             broadcastMessage
           );
+          logActivity(`Broadcast sent to ${channelName}`);
         } catch (error) {
-          console.error(`Error broadcasting to ${channelName}:`, error);
+          logError(`Error broadcasting to ${channelName}:`, error);
         }
       }
       
@@ -272,9 +338,12 @@ bot.on('text', async (ctx) => {
       }
       
       const selectedThumbnail = userState.thumbnails[choice - 1];
+      
+      // Update database
       userState.selectedThumbnail = selectedThumbnail;
       userState.waitingForThumbnailSelection = false;
       userState.waitingForUrl = true;
+      await userState.save();
       
       // Ask for URL
       ctx.reply('Great! Now please send me the URL to include with this post:');
@@ -284,6 +353,7 @@ bot.on('text', async (ctx) => {
       userState.url = ctx.message.text;
       userState.waitingForUrl = false;
       userState.waitingForCaption = true;
+      await userState.save();
       
       ctx.reply('Thanks! Now please send me the caption for this post:');
       
@@ -292,50 +362,65 @@ bot.on('text', async (ctx) => {
       userState.caption = ctx.message.text;
       userState.waitingForCaption = false;
       userState.waitingForChannelSelection = true;
+      await userState.save();
       
       // Create keyboard with channel options
       const channelKeyboard = Markup.inlineKeyboard([
-        [Markup.button.callback('STUFF', 'channel_STUFF'), Markup.button.callback('MOVIE', 'channel_MOVIE')]
+        [
+          Markup.button.callback('STUFF', 'channel_STUFF'), 
+          Markup.button.callback('MOVIE', 'channel_MOVIE')
+        ]
       ]);
       
       ctx.reply('Select which channel to post to:', channelKeyboard);
     }
   } catch (error) {
-    console.error('Error handling text message:', error);
+    logError('Error handling text message:', error);
     ctx.reply('Sorry, an error occurred. Please try again.');
   }
 });
 
 // Handle channel selection
-bot.action(/channel_(.+)/, async (ctx) => {
+bot.action(/channel_(.+)/, adminCheckMiddleware, async (ctx) => {
   const userId = ctx.from.id;
-  const userState = userStates[userId];
   const selectedChannel = ctx.match[1]; // STUFF or MOVIE
   
-  if (!userState) return;
-  
   try {
+    // Retrieve user state from database
+    const userState = await UserState.findOne({ userId });
+    
+    if (!userState) return;
+    
     await ctx.answerCbQuery(`Selected ${selectedChannel} channel`);
+    
+    // Update database
     userState.selectedChannel = CHANNELS[selectedChannel];
     userState.channelName = selectedChannel;
+    await userState.save();
     
     ctx.reply(`Preparing to post to ${selectedChannel} channel...`);
     
     // Post to channel
     await postToChannel(ctx, userId);
   } catch (error) {
-    console.error('Error handling channel selection:', error);
+    logError('Error handling channel selection:', error);
     ctx.reply('Sorry, there was an error with your channel selection. Please try again.');
   }
 });
 
 // Post to channel function
 async function postToChannel(ctx, userId) {
-  const userState = userStates[userId];
-  const channelId = userState.selectedChannel;
-  const channelName = userState.channelName;
-  
   try {
+    // Retrieve user state from database
+    const userState = await UserState.findOne({ userId });
+    
+    if (!userState) {
+      throw new Error('User state not found');
+    }
+    
+    const channelId = userState.selectedChannel;
+    const channelName = userState.channelName;
+    
     // Create inline keyboard with URL button and join channel button
     const joinButton = `Join ${channelName}`;
     const channelUrl = `https://t.me/${channelId.replace('@', '')}`;
@@ -344,6 +429,11 @@ async function postToChannel(ctx, userId) {
       [Markup.button.url('Visit Website', userState.url)],
       [Markup.button.url(joinButton, channelUrl)]
     ]);
+    
+    // Verify thumbnail exists
+    if (!userState.selectedThumbnail || !fs.existsSync(userState.selectedThumbnail)) {
+      throw new Error('Selected thumbnail file not found');
+    }
     
     // Post photo with caption and inline buttons to channel
     await ctx.telegram.sendPhoto(
@@ -355,12 +445,13 @@ async function postToChannel(ctx, userId) {
       }
     );
     
+    logActivity(`Posted to ${channelId}`);
     ctx.reply(`Successfully posted to ${channelId}!`);
     
     // Clean up
-    cleanupTempFiles(userId);
+    await cleanupTempFiles(userId);
   } catch (error) {
-    console.error('Error posting to channel:', error);
+    logError('Error posting to channel:', error);
     ctx.reply('Sorry, there was an error posting to the channel. Please make sure the bot is an admin in the channel with posting permissions.');
   }
 }
@@ -368,66 +459,96 @@ async function postToChannel(ctx, userId) {
 // Handle manual thumbnail upload
 bot.on('photo', adminCheckMiddleware, async (ctx) => {
   const userId = ctx.from.id;
-  const userState = userStates[userId];
   
-  if (userState && userState.waitingForManualThumbnail) {
+  try {
+    // Retrieve user state from database
+    const userState = await UserState.findOne({ userId });
+    
+    if (!userState || !userState.waitingForManualThumbnail) {
+      return ctx.reply('Please send me a video first, then I can generate thumbnails for you.');
+    }
+    
     const photo = ctx.message.photo[ctx.message.photo.length - 1]; // Get the highest resolution
     const fileId = photo.file_id;
     
-    try {
-      // Download the manually uploaded thumbnail
-      const thumbnailPath = await thumbnailGenerator.downloadThumbnailFromTelegram(fileId, BOT_TOKEN);
+    // Download the manually uploaded thumbnail
+    const thumbnailPath = await thumbnailGenerator.downloadThumbnailFromTelegram(fileId, BOT_TOKEN);
+    
+    if (thumbnailPath) {
+      // Update database
+      userState.selectedThumbnail = thumbnailPath;
+      userState.waitingForManualThumbnail = false;
+      userState.waitingForUrl = true;
+      await userState.save();
       
-      if (thumbnailPath) {
-        userState.selectedThumbnail = thumbnailPath;
-        userState.waitingForManualThumbnail = false;
-        userState.waitingForUrl = true;
-        
-        // Ask for URL
-        ctx.reply('Thanks! Now please send me the URL to include with this post:');
-      } else {
-        throw new Error('Failed to download thumbnail');
-      }
-    } catch (error) {
-      console.error('Error handling manually uploaded thumbnail:', error);
-      ctx.reply('Sorry, there was an error processing your thumbnail. Please try again.');
+      // Ask for URL
+      ctx.reply('Thanks! Now please send me the URL to include with this post:');
+    } else {
+      throw new Error('Failed to download thumbnail');
     }
-  } else {
-    ctx.reply('Please send me a video first, then I can generate thumbnails for you.');
+  } catch (error) {
+    logError('Error handling manually uploaded thumbnail:', error);
+    ctx.reply('Sorry, there was an error processing your thumbnail. Please try again.');
   }
 });
 
 // Error handling for thumbnail generation
 async function handleThumbnailGenerationError(ctx, userId) {
-  ctx.reply('I was unable to automatically extract thumbnails from your video. Please upload an image to use as a thumbnail instead.');
-  
-  // Update user state
-  userStates[userId].waitingForManualThumbnail = true;
-  userStates[userId].waitingForThumbnailSelection = false;
+  try {
+    ctx.reply('I was unable to automatically extract thumbnails from your video. Please upload an image to use as a thumbnail instead.');
+    
+    // Update user state in database
+    await UserState.findOneAndUpdate(
+      { userId },
+      { 
+        waitingForManualThumbnail: true,
+        waitingForThumbnailSelection: false
+      }
+    );
+  } catch (error) {
+    logError('Error handling thumbnail generation error:', error);
+    ctx.reply('An error occurred. Please try starting over with /start');
+  }
 }
 
-// Clean up temporary files
-function cleanupTempFiles(userId) {
-  const userState = userStates[userId];
-  
-  if (!userState) return;
-  
-  // Clean up thumbnails
-  if (userState.thumbnails) {
-    thumbnailGenerator.cleanupThumbnails(userState.thumbnails);
-  }
-  
-  // Handle selected thumbnail separately
-  if (userState.selectedThumbnail && fs.existsSync(userState.selectedThumbnail)) {
-    try {
-      fs.unlinkSync(userState.selectedThumbnail);
-    } catch (err) {
-      console.error(`Error deleting selected thumbnail file ${userState.selectedThumbnail}:`, err);
+// Clean up temporary files with improved error handling
+async function cleanupTempFiles(userId) {
+  try {
+    // Get user state from database
+    const userState = await UserState.findOne({ userId });
+    
+    if (!userState) return;
+    
+    // Clean up thumbnails
+    if (userState.thumbnails && Array.isArray(userState.thumbnails)) {
+      for (const thumbnail of userState.thumbnails) {
+        try {
+          if (thumbnail && fs.existsSync(thumbnail)) {
+            fs.unlinkSync(thumbnail);
+            logActivity(`Deleted thumbnail: ${thumbnail}`);
+          }
+        } catch (err) {
+          logError(`Error deleting thumbnail file ${thumbnail}:`, err);
+        }
+      }
     }
+    
+    // Handle selected thumbnail separately
+    if (userState.selectedThumbnail && fs.existsSync(userState.selectedThumbnail)) {
+      try {
+        fs.unlinkSync(userState.selectedThumbnail);
+        logActivity(`Deleted selected thumbnail: ${userState.selectedThumbnail}`);
+      } catch (err) {
+        logError(`Error deleting selected thumbnail file ${userState.selectedThumbnail}:`, err);
+      }
+    }
+    
+    // Remove user state from database (or mark as completed)
+    await UserState.findOneAndDelete({ userId });
+    logActivity(`Cleaned up state for user ${userId}`);
+  } catch (error) {
+    logError(`Error during cleanup for user ${userId}:`, error);
   }
-  
-  // Clear user state
-  delete userStates[userId];
 }
 
 // Create HTTP server for health checks
@@ -449,7 +570,7 @@ server.listen(PORT, () => {
 
 // Handle errors in the HTTP server
 server.on('error', (err) => {
-  console.error('HTTP server error:', err);
+  logError('HTTP server error:', err);
   if (err.code === 'EADDRINUSE') {
     console.error(`Port ${PORT} is already in use. The bot may already be running or another service is using this port.`);
     console.log('Attempting to choose a different port...');
@@ -469,12 +590,12 @@ server.on('error', (err) => {
 
 // Handle bot errors
 bot.catch((err, ctx) => {
-  console.error(`Bot error for ${ctx.updateType}:`, err);
+  logError(`Bot error for ${ctx.updateType}:`, err);
   // Try to notify user of error
   try {
     ctx.reply('Sorry, an error occurred processing your request. Please try again.');
   } catch (replyErr) {
-    console.error('Error sending error notification:', replyErr);
+    logError('Error sending error notification:', replyErr);
   }
 });
 
@@ -504,7 +625,7 @@ function startBot() {
       
     } catch (error) {
       launchAttempts++;
-      console.error(`Failed to launch bot (attempt ${launchAttempts}):`, error);
+      logError(`Failed to launch bot (attempt ${launchAttempts}):`, error);
       
       if (launchAttempts < maxAttempts) {
         const retryDelay = Math.pow(2, launchAttempts) * 1000; // Exponential backoff
@@ -522,10 +643,15 @@ function startBot() {
   attemptLaunch();
 }
 
-// Keep the process alive
+// Keep the process alive with improved error handling
 process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
-  // Don't exit, try to keep running
+  logError('Uncaught exception:', err);
+  // Log but don't exit - try to keep running
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  logError('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Log but don't exit - try to keep running
 });
 
 // Export modules for testing if needed
