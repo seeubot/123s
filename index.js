@@ -6,6 +6,7 @@
 // - Multiple channel posting options
 // - Inline URL buttons & join channel buttons
 // - Broadcasting capability
+// - HTTP health check server for hosting platform compatibility
 
 const { Telegraf, Markup } = require('telegraf');
 const fs = require('fs');
@@ -13,6 +14,7 @@ const path = require('path');
 const axios = require('axios');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
+const http = require('http');
 
 // Import ffmpeg-static and set it up with fluent-ffmpeg
 const ffmpegPath = require('ffmpeg-static');
@@ -438,31 +440,77 @@ function cleanupTempFiles(userId) {
   delete userStates[userId];
 }
 
-// Test connection before fully launching
-console.log('Testing connection to Telegram API...');
-bot.telegram.getMe()
-  .then(botInfo => {
-    console.log(`Connection successful! Bot info:`, botInfo);
-    console.log(`Bot name: ${botInfo.first_name}, Username: @${botInfo.username}`);
-    
-    // Start the bot after successful connection test
-    console.log('Starting bot...');
-    return bot.launch();
-  })
-  .then(() => {
-    console.log('Bot started successfully!');
-  })
-  .catch(err => {
-    console.error('Failed to connect to Telegram API:', err.message);
-    if (err.response) {
-      console.error('Response details:', err.response);
-    }
-    console.error('\nPossible issues:');
-    console.error('1. Bot token may be invalid - double-check with BotFather');
-    console.error('2. Network connectivity issues');
-    console.error('3. Telegram API might be blocked on your network');
-  });
+// Create HTTP server for health checks
+const PORT = process.env.PORT || 8000;
+const server = http.createServer((req, res) => {
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'text/plain');
+  res.end('Bot is running!\n');
+});
+
+// Start HTTP server first, then launch the bot
+server.listen(PORT, () => {
+  console.log(`Health check server running on port ${PORT}`);
+  
+  // Test connection before fully launching
+  console.log('Testing connection to Telegram API...');
+  bot.telegram.getMe()
+    .then(botInfo => {
+      console.log(`Connection successful! Bot info:`, botInfo);
+      console.log(`Bot name: ${botInfo.first_name}, Username: @${botInfo.username}`);
+      
+      // Start the bot after successful connection test
+      console.log('Starting bot...');
+      return bot.launch();
+    })
+    .then(() => {
+      console.log('Bot started successfully!');
+    })
+    .catch(err => {
+      console.error('Failed to connect to Telegram API:', err.message);
+      if (err.response) {
+        console.error('Response details:', err.response);
+      }
+      console.error('\nPossible issues:');
+      console.error('1. Bot token may be invalid - double-check with BotFather');
+      console.error('2. Network connectivity issues');
+      console.error('3. Telegram API might be blocked on your network');
+    });
+});
+
+// Enhanced error handling for the HTTP server
+server.on('error', (err) => {
+  console.error('HTTP server error:', err);
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use. Try a different port.`);
+    process.exit(1);
+  }
+});
 
 // Enable graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', () => {
+  console.log('Received SIGINT. Shutting down gracefully...');
+  bot.stop('SIGINT');
+  server.close(() => {
+    console.log('HTTP server closed.');
+  });
+});
+
+process.once('SIGTERM', () => {
+  console.log('Received SIGTERM. Shutting down gracefully...');
+  bot.stop('SIGTERM');
+  server.close(() => {
+    console.log('HTTP server closed.');
+  });
+});
+
+// Handle uncaught exceptions and unhandled promise rejections to prevent crashes
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+  // Don't exit process, just log the error
+});
+
+process.on('unhandledRejection', (reason, promise) => {
+  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
+  // Don't exit process, just log the error
+});
