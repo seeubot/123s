@@ -1,28 +1,12 @@
-// Advanced Video Thumbnail Generator Bot for Telegram
-// Features:
-// - Handles videos up to 1GB with optimized processing
-// - Generates thumbnails without full download using efficient FFmpeg parameters
-// - Admin-only access control
-// - Multiple channel posting options
-// - Inline URL buttons & join channel buttons
-// - Broadcasting capability
-// - HTTP health check server for hosting platform compatibility
-// - Connection conflict resolution
-
 const { Telegraf, Markup } = require('telegraf');
 const fs = require('fs');
 const path = require('path');
-const axios = require('axios');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 const http = require('http');
-const stream = require('stream');
-const { promisify } = require('util');
 
-// Import ffmpeg-static and set it up with fluent-ffmpeg
-const ffmpegPath = require('ffmpeg-static');
-const ffmpeg = require('fluent-ffmpeg');
-ffmpeg.setFfmpegPath(ffmpegPath);
+// Import our thumbnail generator module
+const ThumbnailGenerator = require('./thumbnailGenerator');
 
 // Get bot token from environment variable or use default
 const BOT_TOKEN = process.env.BOT_TOKEN || '6866329408:AAE7bPEHzZQf2Dh6ccidxxJsWtD-Qj6GKdo';
@@ -51,6 +35,9 @@ console.log(`Token starting with: ${BOT_TOKEN.substring(0, 5)}... (length: ${BOT
 // Initialize the bot
 const bot = new Telegraf(BOT_TOKEN);
 const tempDir = path.join(os.tmpdir(), 'telegram-thumbnails');
+
+// Initialize thumbnail generator
+const thumbnailGenerator = new ThumbnailGenerator(tempDir);
 
 // Maximum accepted video size (1GB)
 const MAX_VIDEO_SIZE = 1024 * 1024 * 1024;
@@ -149,304 +136,61 @@ bot.on('video', adminCheckMiddleware, async (ctx) => {
       aspectRatio: video.width / video.height
     };
     
-    // Process the video thumbnail generation without downloading the entire file
+    // Process the video thumbnail generation
     await processVideoForThumbnails(ctx, userId);
   } catch (error) {
     console.error('Error handling video:', error);
     ctx.reply('Sorry, there was an error processing your video. Please try again or upload a different video.');
     
     // Clean up any temporary files
-    cleanupTempFiles(ctx.from.id);
+    cleanupTempFiles(userId);
   }
 });
 
-// Process videos for thumbnail generation with intelligent frame selection
+// Process videos for thumbnail generation using our external module
 async function processVideoForThumbnails(ctx, userId) {
   const userState = userStates[userId];
   const video = userState.video;
   
   try {
-    await ctx.reply('Analyzing video and preparing smart thumbnail extraction...');
+    await ctx.reply('Analyzing video and preparing thumbnail extraction...');
     
     // Get file info from Telegram
     const fileInfo = await ctx.telegram.getFile(video.file_id);
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
     
-    // Use advanced thumbnail generation
-    const thumbnails = await generateAdvancedThumbnails(ctx, userId, fileUrl);
+    // Use our thumbnail generator module
+    const videoInfo = {
+      duration: video.duration,
+      width: video.width,
+      height: video.height
+    };
+    
+    const thumbnails = await thumbnailGenerator.generateThumbnails(fileUrl, videoInfo);
     
     if (thumbnails && thumbnails.length > 0) {
       // Successfully generated thumbnails
       userState.thumbnails = thumbnails;
       userState.waitingForThumbnailSelection = true;
       
-      await ctx.reply('Choose one of these intelligently selected thumbnails by replying with the number (1-' + thumbnails.length + '):');
+      await ctx.reply('Choose one of these thumbnails by replying with the number (1-' + thumbnails.length + '):');
       
-      // Send each thumbnail with its type description
-      const thumbnailTypes = ['Scene Change', 'Balanced Composition', 'High Motion', 'Bright Scene', 'Detail Rich'];
+      // Send each thumbnail with its number
       for (let i = 0; i < thumbnails.length; i++) {
         await ctx.replyWithPhoto(
           { source: thumbnails[i] }, 
-          { caption: `${i + 1}: ${thumbnailTypes[i] || `Thumbnail ${i + 1}`}` }
+          { caption: `Thumbnail ${i + 1}` }
         );
       }
     } else {
       // If thumbnail generation failed, ask for manual upload
-      handleThumbnailGenerationError(ctx, userId);
+      await handleThumbnailGenerationError(ctx, userId);
     }
   } catch (error) {
     console.error('Error processing video for thumbnails:', error);
     // Ask user for manual thumbnail upload
-    handleThumbnailGenerationError(ctx, userId);
+    await handleThumbnailGenerationError(ctx, userId);
   }
-}
-
-// Advanced thumbnail generation with scene detection and quality assessment
-async function generateAdvancedThumbnails(ctx, userId, fileUrl) {
-  const userState = userStates[userId];
-  const videoDuration = userState.video.duration;
-  const aspectRatio = userState.aspectRatio;
-  
-  try {
-    // Calculate dimensions preserving aspect ratio
-    let width = 320;
-    let height = Math.round(width / aspectRatio);
-    
-    // If height exceeds 240, recalculate to ensure height is 240 max
-    if (height > 240) {
-      height = 240;
-      width = Math.round(height * aspectRatio);
-    }
-    
-    // Generate scene information first to detect key frames
-    const sceneInfo = await analyzeVideoScenes(fileUrl, videoDuration);
-    
-    // Use scene information to generate better thumbnails
-    const thumbnails = [];
-    
-    // If scene detection succeeded, use detected scenes
-    if (sceneInfo && sceneInfo.length > 0) {
-      // Sort scenes by quality score and pick top ones
-      sceneInfo.sort((a, b) => b.score - a.score);
-      
-      // Take top 5 scenes or all if less than 5
-      const topScenes = sceneInfo.slice(0, Math.min(5, sceneInfo.length));
-      
-      // Generate thumbnails for top scenes
-      for (const scene of topScenes) {
-        const thumbnailPath = path.join(tempDir, `thumbnail-${uuidv4()}.jpg`);
-        
-        await new Promise((resolve, reject) => {
-          const command = ffmpeg(fileUrl)
-            .inputOptions([
-              `-ss ${scene.timestamp}`
-            ])
-            .outputOptions([
-              '-frames:v 1',
-              `-s ${width}x${height}`,
-              // Higher quality JPG (lower number = higher quality, range 2-31)
-              '-q:v 2',
-              // Apply adaptive sharpening filter for clarity
-              '-vf unsharp=3:3:1.5:3:3:0.7'
-            ])
-            .output(thumbnailPath);
-          
-          // Add timeout handling
-          const timeout = setTimeout(() => {
-            command.kill('SIGKILL');
-            reject(new Error('Thumbnail generation timed out'));
-          }, 60000); // 60 second timeout
-          
-          command
-            .on('end', () => {
-              clearTimeout(timeout);
-              thumbnails.push(thumbnailPath);
-              resolve();
-            })
-            .on('error', (err) => {
-              clearTimeout(timeout);
-              console.error(`Error generating thumbnail:`, err);
-              reject(err);
-            })
-            .run();
-        });
-      }
-    } else {
-      // Fallback: If scene detection failed, use intelligent timestamps
-      // These timestamps target potential key moments in various video types
-      const intelligentTimestamps = [
-        Math.min(5, videoDuration * 0.05),              // Early frame (intro)
-        videoDuration * 0.25,                           // First quarter
-        videoDuration * 0.5,                            // Middle
-        Math.max(videoDuration * 0.65, videoDuration - 30), // Action often happens here
-        Math.max(videoDuration * 0.85, videoDuration - 10)  // Near end but avoid credits
-      ];
-      
-      for (const timestamp of intelligentTimestamps) {
-        // Don't exceed video duration
-        if (timestamp >= videoDuration) continue;
-        
-        const thumbnailPath = path.join(tempDir, `thumbnail-${uuidv4()}.jpg`);
-        
-        await new Promise((resolve, reject) => {
-          // Use ffmpeg with optimized options for thumbnail quality
-          const command = ffmpeg(fileUrl)
-            .inputOptions([
-              // Seek efficiently
-              `-ss ${timestamp}`
-            ])
-            .outputOptions([
-              // Just get one frame
-              '-frames:v 1',
-              // Set size
-              `-s ${width}x${height}`,
-              // High quality
-              '-q:v 2',
-              // Apply auto-contrast filter for better visibility
-              '-vf eq=contrast=1.1:brightness=0.05:saturation=1.2'
-            ])
-            .output(thumbnailPath);
-          
-          // Add timeout handling
-          const timeout = setTimeout(() => {
-            command.kill('SIGKILL');
-            reject(new Error('Thumbnail generation timed out'));
-          }, 60000);
-          
-          command
-            .on('end', () => {
-              clearTimeout(timeout);
-              thumbnails.push(thumbnailPath);
-              resolve();
-            })
-            .on('error', (err) => {
-              clearTimeout(timeout);
-              console.error(`Error in fallback thumbnail generation:`, err);
-              reject(err);
-            })
-            .run();
-        });
-      }
-    }
-    
-    return thumbnails;
-  } catch (thumbnailError) {
-    console.error('Error in advanced thumbnail generation:', thumbnailError);
-    
-    // Last resort - try simple thumbnail extraction
-    try {
-      return await generateSimpleThumbnails(fileUrl, videoDuration, userState.aspectRatio);
-    } catch (fallbackError) {
-      console.error('Error in fallback thumbnail generation:', fallbackError);
-      return null;
-    }
-  }
-}
-
-// Analyze video scenes using FFmpeg scene detection
-async function analyzeVideoScenes(fileUrl, videoDuration) {
-  try {
-    const scenes = [];
-    const sceneDetectionOutput = path.join(tempDir, `scene-detection-${uuidv4()}.txt`);
-    
-    await new Promise((resolve, reject) => {
-      // Sample the video at multiple points to detect scene changes
-      // We'll sample no more than 30 seconds total to keep it efficient
-      const sampleDuration = Math.min(30, videoDuration);
-      const startOffset = Math.max(1, videoDuration * 0.1); // Skip first 10% to avoid intros
-      
-      ffmpeg(fileUrl)
-        .inputOptions([
-          // Start a bit into the video to skip intros
-          `-ss ${startOffset}`,
-          // Limit duration to sample
-          `-t ${sampleDuration}`
-        ])
-        .outputOptions([
-          // Scene detection filter
-          '-vf select=\'gt(scene,0.4)\',metadata=print:file=' + sceneDetectionOutput,
-          // Empty output - we just want the scene detection metadata
-          '-f null'
-        ])
-        .output('pipe:1')
-        .on('end', () => resolve())
-        .on('error', (err) => reject(err))
-        .run();
-    });
-    
-    // Read detected scenes
-    if (fs.existsSync(sceneDetectionOutput)) {
-      const sceneData = fs.readFileSync(sceneDetectionOutput, 'utf8');
-      const lines = sceneData.split('\n');
-      
-      // Parse scene information
-      for (const line of lines) {
-        if (line.includes('lavfi.scene_score=')) {
-          const timestampMatch = line.match(/pts_time:([\d.]+)/);
-          const scoreMatch = line.match(/lavfi\.scene_score=([\d.]+)/);
-          
-          if (timestampMatch && scoreMatch) {
-            const timestamp = parseFloat(timestampMatch[1]) + startOffset;
-            const score = parseFloat(scoreMatch[1]);
-            
-            // Only add if timestamp is within video duration
-            if (timestamp < videoDuration) {
-              scenes.push({
-                timestamp,
-                score
-              });
-            }
-          }
-        }
-      }
-      
-      // Clean up scene detection output file
-      try { fs.unlinkSync(sceneDetectionOutput); } catch (e) { /* ignore */ }
-    }
-    
-    return scenes;
-  } catch (error) {
-    console.error('Error analyzing video scenes:', error);
-    return null;
-  }
-}
-
-// Simple thumbnail generation as last resort
-async function generateSimpleThumbnails(fileUrl, videoDuration, aspectRatio) {
-  // Calculate dimensions
-  let width = 320;
-  let height = Math.round(width / aspectRatio);
-  if (height > 240) {
-    height = 240;
-    width = Math.round(height * aspectRatio);
-  }
-  
-  const thumbnails = [];
-  // Just get 3 simple thumbnails
-  const positions = [0.1, 0.5, 0.9].map(fraction => Math.min(videoDuration * fraction, videoDuration - 1));
-  
-  for (const position of positions) {
-    const thumbnailPath = path.join(tempDir, `thumbnail-simple-${uuidv4()}.jpg`);
-    
-    await new Promise((resolve, reject) => {
-      ffmpeg(fileUrl)
-        .inputOptions([`-ss ${position}`])
-        .outputOptions([
-          '-frames:v 1',
-          `-s ${width}x${height}`,
-          '-q:v 3'
-        ])
-        .output(thumbnailPath)
-        .on('end', () => {
-          thumbnails.push(thumbnailPath);
-          resolve();
-        })
-        .on('error', err => reject(err))
-        .run();
-    });
-  }
-  
-  return thumbnails;
 }
 
 // Handle text messages - apply admin check only for users in specific state
@@ -597,34 +341,19 @@ bot.on('photo', adminCheckMiddleware, async (ctx) => {
     const fileId = photo.file_id;
     
     try {
-      // Get file info from Telegram
-      const fileInfo = await ctx.telegram.getFile(fileId);
-      const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
+      // Use our thumbnail generator module to download the photo
+      const thumbnailPath = await thumbnailGenerator.downloadThumbnailFromTelegram(fileId, BOT_TOKEN);
       
-      // Generate a unique filename for the thumbnail
-      const thumbnailPath = path.join(tempDir, `manual-thumbnail-${uuidv4()}.jpg`);
-      
-      // Download the photo
-      const response = await axios({
-        method: 'GET',
-        url: fileUrl,
-        responseType: 'stream'
-      });
-      
-      const writer = fs.createWriteStream(thumbnailPath);
-      response.data.pipe(writer);
-      
-      await new Promise((resolve, reject) => {
-        writer.on('finish', resolve);
-        writer.on('error', reject);
-      });
-      
-      userState.selectedThumbnail = thumbnailPath;
-      userState.waitingForManualThumbnail = false;
-      userState.waitingForUrl = true;
-      
-      // Ask for URL
-      ctx.reply('Thanks! Now please send me the URL to include with this post:');
+      if (thumbnailPath) {
+        userState.selectedThumbnail = thumbnailPath;
+        userState.waitingForManualThumbnail = false;
+        userState.waitingForUrl = true;
+        
+        // Ask for URL
+        ctx.reply('Thanks! Now please send me the URL to include with this post:');
+      } else {
+        throw new Error('Failed to download thumbnail');
+      }
     } catch (error) {
       console.error('Error handling manually uploaded thumbnail:', error);
       ctx.reply('Sorry, there was an error processing your thumbnail. Please try again.');
@@ -635,8 +364,8 @@ bot.on('photo', adminCheckMiddleware, async (ctx) => {
 });
 
 // Improved error handling in thumbnail generation
-function handleThumbnailGenerationError(ctx, userId) {
-  ctx.reply('I was unable to automatically extract thumbnails from your video due to its size or format. Please upload an image to use as a thumbnail instead.');
+async function handleThumbnailGenerationError(ctx, userId) {
+  ctx.reply('I was unable to automatically extract thumbnails from your video due to its format or size. Please upload an image to use as a thumbnail instead.');
   
   // Update user state
   userStates[userId].waitingForManualThumbnail = true;
@@ -649,20 +378,12 @@ function cleanupTempFiles(userId) {
   
   if (!userState) return;
   
-  // Delete thumbnail files
+  // Use our thumbnail generator to clean up thumbnails
   if (userState.thumbnails) {
-    userState.thumbnails.forEach(thumbnail => {
-      if (fs.existsSync(thumbnail)) {
-        try {
-          fs.unlinkSync(thumbnail);
-        } catch (err) {
-          console.error(`Error deleting thumbnail file ${thumbnail}:`, err);
-        }
-      }
-    });
+    thumbnailGenerator.cleanupThumbnails(userState.thumbnails);
   }
   
-  // Delete selected thumbnail if exists
+  // Handle selected thumbnail separately
   if (userState.selectedThumbnail && fs.existsSync(userState.selectedThumbnail)) {
     try {
       fs.unlinkSync(userState.selectedThumbnail);
@@ -694,7 +415,7 @@ bot.catch((err, ctx) => {
   }
 });
 
-// FIXED: Modified launch process with retry and conflict resolution
+// Modified launch process with retry and conflict resolution
 let launchAttempts = 0;
 const maxAttempts = 5;
 
