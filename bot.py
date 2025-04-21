@@ -3,12 +3,14 @@ import logging
 import pickle
 import datetime
 import tempfile
+import math
+import time
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder, CommandHandler, MessageHandler, 
     ContextTypes, filters, ConversationHandler, CallbackQueryHandler
 )
-from PIL import Image  # Using PIL instead of OpenCV
+from PIL import Image
 import requests
 from io import BytesIO
 from moviepy.editor import VideoFileClip  # Alternative to OpenCV for video processing
@@ -37,6 +39,9 @@ ADMIN_USER_ID = int(os.environ.get("ADMIN_USER_ID", "1352497419"))
 # Debug and Auto-start settings
 DEBUG_MODE = os.environ.get("DEBUG_MODE", "False").lower() == "true"
 AUTO_START = os.environ.get("AUTO_START", "True").lower() == "true"
+
+# Max file size setting - 1GB (in bytes)
+MAX_FILE_SIZE = 1024 * 1024 * 1024  # 1GB
 
 # Session and history files
 SESSION_FILE = "bot_session.pickle"
@@ -179,7 +184,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"💡 Current settings:\n"
         f"- Debug mode: {'✅ ON' if DEBUG_MODE else '❌ OFF'}\n"
         f"- Auto-start: {'✅ ON' if AUTO_START else '❌ OFF'}\n"
-        f"- Webhook mode: {'✅ ON' if USE_WEBHOOK else '❌ OFF'}"
+        f"- Webhook mode: {'✅ ON' if USE_WEBHOOK else '❌ OFF'}\n"
+        f"- Max file size: {MAX_FILE_SIZE/(1024*1024*1024):.1f}GB"
     )
 
 async def toggle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -202,6 +208,7 @@ async def toggle_debug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         debug_log(f"Current configuration: TOKEN={TOKEN[:5]}... ADMIN_USER_ID={ADMIN_USER_ID}")
         debug_log(f"Channels: Main={CHANNEL_USERNAME}, Movies={MOVIES_CHANNEL}, Stuff={STUFF_CHANNEL}")
         debug_log(f"Auto-start: {AUTO_START}, Webhook: {USE_WEBHOOK}, Port: {PORT}")
+        debug_log(f"Max file size: {MAX_FILE_SIZE/(1024*1024*1024):.1f}GB")
 
 async def toggle_autostart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Toggle auto-start mode on/off."""
@@ -245,7 +252,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "/debug - Toggle debug mode on/off\n"
         "/autostart - Toggle auto-start mode on/off\n"
         "/cleanup - Remove temporary files and clear sessions\n"
-        "/broadcast - Send a message to all channels"
+        "/broadcast - Send a message to all channels\n\n"
+        f"The maximum file size is set to {MAX_FILE_SIZE/(1024*1024*1024):.1f}GB"
     )
 
 async def cleanup_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -311,6 +319,7 @@ async def status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"- Debug mode: {'✅ ON' if DEBUG_MODE else '❌ OFF'}\n"
         f"- Auto-start: {'✅ ON' if AUTO_START else '❌ OFF'}\n"
         f"- Webhook mode: {'✅ ON' if USE_WEBHOOK else '❌ OFF'}\n"
+        f"- Max file size: {MAX_FILE_SIZE/(1024*1024*1024):.1f}GB\n"
         f"- Port: {PORT}\n\n"
         f"📊 System:\n"
         f"- Temporary files: {temp_file_count}\n"
@@ -475,6 +484,59 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Operation cancelled.")
     return ConversationHandler.END
 
+async def download_large_file_with_progress(bot, file_id, file_path, update, context):
+    """Download a large file with progress updates."""
+    try:
+        # Get file info first
+        file_info = await bot.get_file(file_id)
+        file_size = file_info.file_size
+        
+        if file_size > MAX_FILE_SIZE:
+            raise ValueError(f"File size ({file_size/(1024*1024):.1f} MB) exceeds the maximum allowed size ({MAX_FILE_SIZE/(1024*1024*1024):.1f} GB)")
+        
+        debug_log(f"Starting download of file {file_id} with size {file_size/(1024*1024):.1f} MB")
+        
+        # Send initial progress message
+        progress_message = await update.message.reply_text("Starting download: 0%")
+        
+        # Get file URL
+        file_url = await file_info.get_url()
+        
+        # Use requests to download with progress
+        with requests.get(file_url, stream=True) as response:
+            response.raise_for_status()
+            content_length = int(response.headers.get('content-length', 0))
+            
+            # Create parent directory if it doesn't exist
+            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            
+            downloaded = 0
+            last_update_time = time.time()
+            update_interval = 3  # Update progress every 3 seconds
+            
+            with open(file_path, 'wb') as f:
+                for chunk in response.iter_content(chunk_size=8192*16):  # Larger chunk size for speed
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        
+                        # Update progress less frequently
+                        current_time = time.time()
+                        if current_time - last_update_time > update_interval:
+                            progress = (downloaded / content_length) * 100 if content_length > 0 else 0
+                            await progress_message.edit_text(f"Downloading: {progress:.1f}%")
+                            last_update_time = current_time
+        
+        # Final update
+        await progress_message.edit_text("Download complete! Processing video...")
+        debug_log(f"Download completed successfully, file saved to {file_path}")
+        return True
+    
+    except Exception as e:
+        logger.error(f"Error downloading file: {e}")
+        await update.message.reply_text(f"Error downloading file: {str(e)}")
+        return False
+
 async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Process the video and generate multiple thumbnails."""
     # Check if user is admin
@@ -492,18 +554,46 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         )
         return ConversationHandler.END
     
+    # Check file size first
+    file_size = update.message.video.file_size
+    debug_log(f"Video file size: {file_size/(1024*1024):.1f} MB")
+    
+    if file_size > MAX_FILE_SIZE:
+        await update.message.reply_text(
+            f"The video file is too large ({file_size/(1024*1024):.1f} MB). "
+            f"Maximum allowed size is {MAX_FILE_SIZE/(1024*1024*1024):.1f} GB."
+        )
+        return ConversationHandler.END
+    
     # Notify the user that processing has started
     debug_log(f"Processing video from user {user_id}")
     await update.message.reply_text("Processing your video... Please wait.")
     
     try:
-        # Get the video file
-        video = await update.message.video.get_file()
+        # Get the video file ID
         video_file_id = update.message.video.file_id
-        video_path = os.path.join(TEMP_FOLDER, f"{video_file_id}.mp4")
+        
+        # Create a unique temporary file path
+        temp_dir = tempfile.mkdtemp(dir=TEMP_FOLDER)
+        video_path = os.path.join(temp_dir, f"{video_file_id}.mp4")
         
         debug_log(f"Downloading video {video_file_id} to {video_path}")
-        await video.download_to_drive(video_path)
+        
+        # Download the file with progress updates
+        download_success = await download_large_file_with_progress(
+            context.bot, 
+            video_file_id, 
+            video_path, 
+            update, 
+            context
+        )
+        
+        if not download_success:
+            debug_log("Video download failed")
+            # Clean up temp directory
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return ConversationHandler.END
         
         # Initialize user data
         user_data[user_id] = {
@@ -518,13 +608,23 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             duration = update.message.video.duration
             debug_log(f"Video metadata: Size={file_size_mb:.2f}MB, Duration={duration}s")
         
-        # Generate multiple thumbnails at different positions
+        # Inform user about thumbnail extraction
+        await update.message.reply_text("Video downloaded successfully. Extracting thumbnails...")
+        
+        # For large files, use a more efficient approach with fewer thumbnails at strategic points
         positions = [0.1, 0.25, 0.5, 0.75, 0.9]  # Positions for thumbnails
         thumbnails = []
         
+        # Process thumbnails with status updates
+        status_message = await update.message.reply_text("Extracting thumbnails: 0%")
+        
         for i, pos in enumerate(positions):
-            thumbnail_path = os.path.join(TEMP_FOLDER, f"{video_file_id}_thumbnail_{i}.jpg")
+            thumbnail_path = os.path.join(temp_dir, f"{video_file_id}_thumbnail_{i}.jpg")
             debug_log(f"Extracting thumbnail {i+1} at position {pos*100:.0f}%")
+            
+            # Update progress
+            await status_message.edit_text(f"Extracting thumbnails: {(i+1)/len(positions)*100:.0f}%")
+            
             success = extract_thumbnail(video_path, thumbnail_path, pos)
             
             if success:
@@ -533,6 +633,9 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
                 debug_log(f"Thumbnail {i+1} extracted successfully to {thumbnail_path}")
             else:
                 debug_log(f"Failed to extract thumbnail {i+1}")
+        
+        # Update final status
+        await status_message.edit_text("Thumbnail extraction complete!")
         
         save_session()
         
@@ -552,11 +655,16 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             
             # Send all thumbnails
             for i, thumb_path in enumerate(thumbnails):
-                with open(thumb_path, 'rb') as thumb_file:
-                    await update.message.reply_photo(
-                        photo=thumb_file, 
-                        caption=f"Thumbnail {i+1} (from position {positions[i]*100:.0f}%)"
-                    )
+                try:
+                    with open(thumb_path, 'rb') as thumb_file:
+                        await update.message.reply_photo(
+                            photo=thumb_file, 
+                            caption=f"Thumbnail {i+1} (from position {positions[i]*100:.0f}%)"
+                        )
+                except Exception as e:
+                    logger.error(f"Error sending thumbnail {i+1}: {e}")
+                    # Continue with other thumbnails if one fails
+                    continue
             
             # Send selection message
             await update.message.reply_text(
@@ -567,9 +675,13 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
             return WAITING_FOR_THUMBNAIL_SELECTION
         else:
             debug_log("No thumbnails could be generated")
-            await update.message.reply_text("Sorry, I couldn't generate thumbnails from your video.")
+            await update.message.reply_text(
+                "Sorry, I couldn't generate thumbnails from your video. The video might be corrupted or in an unsupported format."
+            )
             # Clean up files
             try_delete_file(video_path)
+            import shutil
+            shutil.rmtree(temp_dir, ignore_errors=True)
             # Remove user data
             if user_id in user_data:
                 del user_data[user_id]
@@ -580,7 +692,8 @@ async def process_video(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         logger.error(f"Error processing video: {e}")
         debug_log(f"Exception in process_video: {str(e)}")
         await update.message.reply_text(
-            "Sorry, there was an error processing your video. Please try again later."
+            f"Sorry, there was an error processing your video: {str(e)}\n\n"
+            "Try with a smaller video or from a different source."
         )
         return ConversationHandler.END
 
@@ -600,160 +713,216 @@ async def select_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     if user_id not in user_data:
         debug_log(f"No active session for user {user_id}")
-        await query.edit_message_text("Sorry, there was an error. Please start over by sending a video.")
+        await query.edit_message_text("Sorry, there was an error. Please start over.")
         return ConversationHandler.END
     
     # Handle custom thumbnail request
     if query.data == CALLBACK_THUMBNAIL_CUSTOM:
         debug_log("User requested custom thumbnail position")
         await query.edit_message_text(
-            "Please specify a position between 0-100% (just type a number like '30' for 30%):"
+            "Please enter a position for the thumbnail (0-100%).\n"
+            "For example, enter '35' for a thumbnail at 35% of the video duration."
         )
-        
-        # We'll stay in the same state, but process text input instead
+        user_data[user_id]['waiting_for_custom_thumbnail'] = True
+        save_session()
         return WAITING_FOR_THUMBNAIL_SELECTION
     
-    # Handle selection of predefined thumbnail
-    thumbnail_index = int(query.data.replace(CALLBACK_THUMBNAIL_START, ""))
-    debug_log(f"User selected predefined thumbnail {thumbnail_index + 1}")
+    # Handle regular thumbnail selection
+    if query.data.startswith(CALLBACK_THUMBNAIL_START):
+        # Extract thumbnail index
+        try:
+            thumb_index = int(query.data.replace(CALLBACK_THUMBNAIL_START, ""))
+            if 'thumbnails' not in user_data[user_id] or thumb_index >= len(user_data[user_id]['thumbnails']):
+                debug_log(f"Invalid thumbnail index: {thumb_index}")
+                await query.edit_message_text("Invalid thumbnail selection. Please try again.")
+                return WAITING_FOR_THUMBNAIL_SELECTION
+            
+            # Save selected thumbnail
+            selected_thumbnail = user_data[user_id]['thumbnails'][thumb_index]
+            user_data[user_id]['thumbnail_path'] = selected_thumbnail
+            debug_log(f"User selected thumbnail #{thumb_index+1}: {selected_thumbnail}")
+            
+            # Move to next step
+            await query.edit_message_text("Great! Now please enter the URL you want to link to in the post:")
+            save_session()
+            return WAITING_FOR_URL
+            
+        except (ValueError, IndexError) as e:
+            logger.error(f"Error processing thumbnail selection: {e}")
+            await query.edit_message_text("There was an error with your selection. Please try again.")
+            return WAITING_FOR_THUMBNAIL_SELECTION
     
-    if 'thumbnails' in user_data[user_id] and thumbnail_index < len(user_data[user_id]['thumbnails']):
-        user_data[user_id]['thumbnail_path'] = user_data[user_id]['thumbnails'][thumbnail_index]
-        save_session()
-        
-        await query.edit_message_text(f"You selected thumbnail {thumbnail_index+1}. Now, please send me the URL you want to link to.")
-        return WAITING_FOR_URL
-    else:
-        debug_log(f"Invalid thumbnail index: {thumbnail_index}")
-        await query.edit_message_text("Invalid thumbnail selection. Please try again.")
-        return ConversationHandler.END
+    # If we get here, something went wrong
+    await query.edit_message_text("Invalid selection. Please try again or /cancel to start over.")
+    return WAITING_FOR_THUMBNAIL_SELECTION
 
-async def process_custom_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process custom thumbnail position input."""
+async def handle_custom_thumbnail(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle custom thumbnail position input."""
+    user_id = update.effective_user.id
+    
     # Check if user is admin
     if not await check_admin(update):
         return ConversationHandler.END
     
-    user_id = update.effective_user.id
-    position_text = update.message.text.strip()
-    debug_log(f"Custom thumbnail position request: {position_text}")
-    
-    if user_id not in user_data or 'video_path' not in user_data[user_id]:
-        debug_log(f"No active video session for user {user_id}")
-        await update.message.reply_text("Sorry, there was an error. Please start over by sending a video.")
+    if user_id not in user_data or 'waiting_for_custom_thumbnail' not in user_data[user_id]:
+        await update.message.reply_text("Sorry, there was an error. Please start over.")
         return ConversationHandler.END
     
     try:
-        # Parse the position
-        position_text = position_text.replace('%', '')
-        position = float(position_text) / 100.0
-        
-        if position < 0 or position > 1:
-            debug_log(f"Invalid position value: {position}")
-            await update.message.reply_text("Position must be between 0 and 100%. Please try again.")
+        # Parse position input
+        position = float(update.message.text.strip())
+        if position < 0 or position > 100:
+            await update.message.reply_text("Position must be between 0 and 100%. Please try again:")
             return WAITING_FOR_THUMBNAIL_SELECTION
         
-        # Generate the custom thumbnail
-        custom_thumbnail_path = os.path.join(TEMP_FOLDER, f"{user_id}_custom_thumbnail.jpg")
-        debug_log(f"Extracting custom thumbnail at position {position*100:.0f}%")
-        success = extract_thumbnail(user_data[user_id]['video_path'], custom_thumbnail_path, position)
+        # Convert to 0-1 range
+        position = position / 100.0
+        debug_log(f"Generating custom thumbnail at position {position*100:.1f}%")
+        
+        # Generate custom thumbnail
+        video_path = user_data[user_id]['video_path']
+        temp_dir = os.path.dirname(video_path)
+        custom_thumbnail_path = os.path.join(temp_dir, f"{os.path.basename(video_path)}_custom.jpg")
+        
+        await update.message.reply_text(f"Generating custom thumbnail at {position*100:.1f}% of video duration...")
+        
+        # Extract thumbnail
+        success = extract_thumbnail(video_path, custom_thumbnail_path, position)
         
         if success:
-            # Save the thumbnail path
+            debug_log(f"Custom thumbnail generated successfully: {custom_thumbnail_path}")
             user_data[user_id]['thumbnail_path'] = custom_thumbnail_path
-            if 'thumbnails' not in user_data[user_id]:
-                user_data[user_id]['thumbnails'] = []
-            user_data[user_id]['thumbnails'].append(custom_thumbnail_path)
+            user_data[user_id].pop('waiting_for_custom_thumbnail', None)
             save_session()
             
-            debug_log(f"Custom thumbnail extracted successfully to {custom_thumbnail_path}")
-            
-            # Show the custom thumbnail
+            # Send the thumbnail for confirmation
             with open(custom_thumbnail_path, 'rb') as thumb_file:
                 await update.message.reply_photo(
                     photo=thumb_file,
-                    caption=f"Custom thumbnail from position {position*100:.0f}%"
+                    caption=f"Custom thumbnail at {position*100:.1f}% position."
                 )
             
-            await update.message.reply_text("Now, please send me the URL you want to link to.")
+            # Move to next step
+            await update.message.reply_text("Great! Now please enter the URL you want to link to in the post:")
             return WAITING_FOR_URL
         else:
-            debug_log("Failed to extract custom thumbnail")
-            await update.message.reply_text("Sorry, I couldn't generate a thumbnail at that position. Please try a different position.")
+            debug_log("Failed to generate custom thumbnail")
+            await update.message.reply_text(
+                "Sorry, I couldn't generate a thumbnail at that position. "
+                "Please try a different position or select one of the pre-generated thumbnails."
+            )
             return WAITING_FOR_THUMBNAIL_SELECTION
             
     except ValueError:
-        debug_log(f"Invalid number format: {position_text}")
-        await update.message.reply_text("Please enter a valid number between 0 and 100.")
-        return WAITING_FOR_THUMBNAIL_SELECTION
-    except Exception as e:
-        logger.error(f"Error creating custom thumbnail: {e}")
-        debug_log(f"Exception in process_custom_thumbnail: {str(e)}")
-        await update.message.reply_text("Sorry, there was an error creating your custom thumbnail. Please try again.")
+        await update.message.reply_text(
+            "Please enter a valid number between 0 and 100. For example: 35"
+        )
         return WAITING_FOR_THUMBNAIL_SELECTION
 
+def extract_thumbnail(video_path, thumbnail_path, position):
+    """Extract a thumbnail from the video at the specified position."""
+    try:
+        debug_log(f"Extracting thumbnail at position {position}")
+        
+        # Open the video clip
+        clip = VideoFileClip(video_path)
+        
+        # Calculate position in seconds
+        duration = clip.duration
+        position_seconds = duration * position
+        
+        debug_log(f"Video duration: {duration}s, extracting at {position_seconds}s")
+        
+        # Get the frame at the specified position
+        frame = clip.get_frame(position_seconds)
+        
+        # Save the frame as an image
+        img = Image.fromarray(frame)
+        img.save(thumbnail_path)
+        
+        # Close the clip
+        clip.close()
+        
+        return True
+    except Exception as e:
+        logger.error(f"Error extracting thumbnail: {e}")
+        return False
+
+def try_delete_file(file_path):
+    """Try to delete a file, ignoring errors."""
+    try:
+        if file_path and os.path.exists(file_path):
+            os.remove(file_path)
+            debug_log(f"Deleted file: {file_path}")
+    except Exception as e:
+        logger.error(f"Error deleting file {file_path}: {e}")
+
 async def process_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process the URL provided by the user."""
+    """Process URL input."""
     # Check if user is admin
     if not await check_admin(update):
         return ConversationHandler.END
     
     user_id = update.effective_user.id
     url = update.message.text.strip()
-    debug_log(f"URL received from user {user_id}: {url}")
     
     if user_id not in user_data:
-        debug_log(f"No active session for user {user_id}")
-        await update.message.reply_text("Sorry, there was an error. Please start over by sending a video.")
+        await update.message.reply_text("Sorry, there was an error. Please start over.")
         return ConversationHandler.END
     
-    # Save the URL
+    # Simple URL validation
+    if not url.startswith(('http://', 'https://')):
+        await update.message.reply_text(
+            "Please enter a valid URL starting with http:// or https://"
+        )
+        return WAITING_FOR_URL
+    
+    debug_log(f"URL received: {url}")
     user_data[user_id]['url'] = url
     save_session()
     
-    await update.message.reply_text("Now, please send me the caption for this post.")
+    await update.message.reply_text(
+        "Now please enter the caption for your post. This will be displayed under the thumbnail."
+    )
     return WAITING_FOR_CAPTION
 
 async def process_caption(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Process the caption provided by the user."""
+    """Process caption input."""
     # Check if user is admin
     if not await check_admin(update):
         return ConversationHandler.END
     
     user_id = update.effective_user.id
-    caption = update.message.text.strip()
-    debug_log(f"Caption received from user {user_id}")
+    caption = update.message.text
     
     if user_id not in user_data:
-        debug_log(f"No active session for user {user_id}")
-        await update.message.reply_text("Sorry, there was an error. Please start over by sending a video.")
+        await update.message.reply_text("Sorry, there was an error. Please start over.")
         return ConversationHandler.END
     
-    # Save the caption
+    debug_log(f"Caption received (length: {len(caption)})")
     user_data[user_id]['caption'] = caption
     save_session()
     
     # Ask which channel to post to
     keyboard = [
-        [InlineKeyboardButton("Movies Channel", callback_data=CALLBACK_MOVIES)],
-        [InlineKeyboardButton("Stuff Channel", callback_data=CALLBACK_STUFF)]
+        [InlineKeyboardButton("MOVIES Channel", callback_data=CALLBACK_MOVIES)],
+        [InlineKeyboardButton("STUFF Channel", callback_data=CALLBACK_STUFF)]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-
+    
     await update.message.reply_text(
-        "Please select which channel to post to:",
+        "Now, please select which channel to post to:",
         reply_markup=reply_markup
     )
-    
     return WAITING_FOR_CHANNEL_SELECTION
 
-async def select_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Handle channel selection."""
+async def select_channel_and_post(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    """Handle channel selection and post the content."""
     query = update.callback_query
     await query.answer()
     
     user_id = query.from_user.id
-    debug_log(f"Channel selection from user {user_id}: {query.data}")
+    debug_log(f"Channel selection callback from user {user_id}: {query.data}")
     
     # Check if user is admin
     if user_id != ADMIN_USER_ID:
@@ -763,33 +932,42 @@ async def select_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     if user_id not in user_data:
         debug_log(f"No active session for user {user_id}")
-        await query.edit_message_text("Sorry, there was an error. Please start over by sending a video.")
+        await query.edit_message_text("Sorry, there was an error. Please start over.")
         return ConversationHandler.END
     
-    # Get the channel based on callback data
-    channel = MOVIES_CHANNEL if query.data == CALLBACK_MOVIES else STUFF_CHANNEL
-    channel_name = "Movies" if query.data == CALLBACK_MOVIES else "Stuff"
+    # Determine which channel was selected
+    channel = None
+    if query.data == CALLBACK_MOVIES:
+        channel = MOVIES_CHANNEL
+        debug_log(f"Selected MOVIES channel: {channel}")
+    elif query.data == CALLBACK_STUFF:
+        channel = STUFF_CHANNEL
+        debug_log(f"Selected STUFF channel: {channel}")
+    else:
+        await query.edit_message_text("Invalid channel selection. Please try again.")
+        return WAITING_FOR_CHANNEL_SELECTION
     
-    debug_log(f"Selected channel: {channel}")
-    user_data[user_id]['channel'] = channel
-    save_session()
+    # Get user data
+    thumbnail_path = user_data[user_id].get('thumbnail_path')
+    url = user_data[user_id].get('url')
+    caption = user_data[user_id].get('caption')
     
-    await query.edit_message_text(f"You selected the {channel_name} Channel. Processing your post...")
+    if not all([thumbnail_path, url, caption]):
+        debug_log("Missing required data for posting")
+        await query.edit_message_text("Missing required data. Please start over.")
+        return ConversationHandler.END
     
-    # Post to the selected channel
+    # Prepare inline keyboard with URL button
+    keyboard = [
+        [InlineKeyboardButton("🔗 Visit Link", url=url)]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    
+    # Send post to channel
     try:
-        # Get all the necessary data
-        thumbnail_path = user_data[user_id]['thumbnail_path']
-        url = user_data[user_id]['url']
-        caption = user_data[user_id]['caption']
+        debug_log(f"Sending post to channel {channel}")
+        await query.edit_message_text("Sending post to channel...")
         
-        debug_log(f"Preparing to post to {channel_name} Channel with URL: {url}")
-        
-        # Create inline keyboard with the URL
-        keyboard = [[InlineKeyboardButton("🔗 Open Link", url=url)]]
-        reply_markup = InlineKeyboardMarkup(keyboard)
-        
-        # Send the thumbnail with caption to the channel
         with open(thumbnail_path, 'rb') as thumb_file:
             message = await context.bot.send_photo(
                 chat_id=channel,
@@ -797,132 +975,123 @@ async def select_channel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
                 caption=caption,
                 reply_markup=reply_markup
             )
-            
-            debug_log(f"Posted successfully to {channel_name} Channel, message ID: {message.message_id}")
         
         # Add to post history
         add_to_post_history(channel, caption, url, thumbnail_path)
         
-        # Send confirmation to admin
-        await update.effective_message.reply_text(
-            f"✅ Post has been successfully sent to the {channel_name} Channel!\n\n"
-            f"Caption: {caption[:30]}{'...' if len(caption) > 30 else ''}\n"
-            f"URL: {url}"
+        # Success message to admin including a link to the post
+        message_link = f"https://t.me/{channel.replace('@', '')}/{message.message_id}"
+        await query.message.reply_text(
+            f"✅ Post successfully sent to {channel}!\n\n"
+            f"View your post: {message_link}"
         )
         
-        # Clean up user data and files
+        # Clean up files
         if 'video_path' in user_data[user_id]:
             try_delete_file(user_data[user_id]['video_path'])
         
         if 'thumbnails' in user_data[user_id]:
-            for thumb_path in user_data[user_id]['thumbnails']:
-                if thumb_path != thumbnail_path:  # Don't delete the one we used
-                    try_delete_file(thumb_path)
+            for thumb in user_data[user_id]['thumbnails']:
+                if thumb != thumbnail_path:  # Don't delete the selected thumbnail yet
+                    try_delete_file(thumb)
         
-        # Keep the selected thumbnail for post history
-        # We won't delete it, just remove from the user data
+        # Keep the thumbnail in the history folder
         
+        # Clear user data
         del user_data[user_id]
         save_session()
+        debug_log(f"Session cleared for user {user_id}")
         
         return ConversationHandler.END
         
     except Exception as e:
         logger.error(f"Error posting to channel: {e}")
-        debug_log(f"Exception in select_channel: {str(e)}")
         await query.edit_message_text(
-            f"❌ Sorry, there was an error posting to the {channel_name} Channel: {str(e)}"
+            f"Sorry, there was an error posting to the channel: {str(e)}\n"
+            "Please try again or contact the developer."
         )
         return ConversationHandler.END
 
-def extract_thumbnail(video_path, output_path, position=0.5):
-    """Extract a thumbnail from the video at the specified position (0.0-1.0)."""
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Handle errors in the dispatcher."""
+    logger.error(f"Exception while handling an update: {context.error}")
+    
+    # Send error message to admin
     try:
-        debug_log(f"Extracting thumbnail from {video_path} at position {position}")
-        
-        with VideoFileClip(video_path) as video:
-            # Calculate the time position
-            time_pos = position * video.duration
+        if update:
+            user_info = f" from user {update.effective_user.id}" if update.effective_user else ""
+            debug_log(f"Error{user_info}: {context.error}")
             
-            # Extract the frame
-            frame = video.get_frame(time_pos)
-            
-            # Convert the frame to an image and save it
-            img = Image.fromarray(frame)
-            img.save(output_path, quality=95)
-            
-            debug_log(f"Thumbnail saved to {output_path}")
-            return True
+            if update.effective_message:
+                await update.effective_message.reply_text(
+                    f"Sorry, an error occurred: {str(context.error)}\n\n"
+                    "Please try again or contact the developer."
+                )
     except Exception as e:
-        logger.error(f"Error extracting thumbnail: {e}")
-        debug_log(f"Failed to extract thumbnail: {str(e)}")
-        return False
+        logger.error(f"Error in error handler: {e}")
 
-def try_delete_file(file_path):
-    """Try to delete a file and log any errors."""
-    if file_path and os.path.exists(file_path):
-        try:
-            os.remove(file_path)
-            debug_log(f"Deleted file: {file_path}")
-            return True
-        except Exception as e:
-            logger.error(f"Error deleting file {file_path}: {e}")
-            debug_log(f"Failed to delete file {file_path}: {str(e)}")
-            return False
-    return False
-
-def main():
+def main() -> None:
     """Start the bot."""
-    # Load session and post history data
+    # Load previous session and post history
     load_session()
     load_post_history()
     
-    # Set up application with token
+    # Create the Application
     application = ApplicationBuilder().token(TOKEN).build()
     
-    # Create conversation handler for main flow
+    # Create a conversation handler
     conv_handler = ConversationHandler(
         entry_points=[
             CommandHandler("start", start),
-            MessageHandler(filters.VIDEO, process_video)
+            MessageHandler(filters.VIDEO & filters.ChatType.PRIVATE, process_video),
         ],
         states={
-            WAITING_FOR_URL: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_url)],
-            WAITING_FOR_CAPTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, process_caption)],
-            WAITING_FOR_CHANNEL_SELECTION: [CallbackQueryHandler(select_channel)],
             WAITING_FOR_THUMBNAIL_SELECTION: [
                 CallbackQueryHandler(select_thumbnail),
-                MessageHandler(filters.TEXT & ~filters.COMMAND, process_custom_thumbnail)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, handle_custom_thumbnail),
+            ],
+            WAITING_FOR_URL: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_url),
+            ],
+            WAITING_FOR_CAPTION: [
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_caption),
+            ],
+            WAITING_FOR_CHANNEL_SELECTION: [
+                CallbackQueryHandler(select_channel_and_post),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     
-    # Create conversation handler for broadcast flow
+    # Create a broadcast conversation handler
     broadcast_handler = ConversationHandler(
         entry_points=[CommandHandler("broadcast", broadcast_command)],
         states={
             WAITING_FOR_BROADCAST_MESSAGE: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, process_broadcast_message)
+                MessageHandler(filters.TEXT & ~filters.COMMAND, process_broadcast_message),
             ],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
     )
     
-    # Add handlers to application
+    # Add conversation handlers
     application.add_handler(conv_handler)
     application.add_handler(broadcast_handler)
+    
+    # Add command handlers
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(CommandHandler("cancel", cancel))
     application.add_handler(CommandHandler("status", status_command))
-    application.add_handler(CommandHandler("posts", posts_command))
     application.add_handler(CommandHandler("debug", toggle_debug))
     application.add_handler(CommandHandler("autostart", toggle_autostart))
     application.add_handler(CommandHandler("cleanup", cleanup_command))
+    application.add_handler(CommandHandler("posts", posts_command))
     
-    # Set up webhook if configured
+    # Add error handler
+    application.add_error_handler(error_handler)
+    
+    # Set up webhook or polling based on environment
     if USE_WEBHOOK and WEBHOOK_URL:
-        logger.info(f"Starting webhook on port {PORT}")
+        debug_log(f"Starting bot with webhook at {WEBHOOK_URL}")
         application.run_webhook(
             listen="0.0.0.0",
             port=PORT,
@@ -930,9 +1099,8 @@ def main():
             webhook_url=f"{WEBHOOK_URL}/{TOKEN}"
         )
     else:
-        # Start polling
-        logger.info("Starting polling")
+        debug_log("Starting bot with polling")
         application.run_polling()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
