@@ -25,4 +25,4 @@ EXPOSE 8000
 ENV NODE_ENV=production
 
 # Start the application
-CMD ["node", "botMain.js"]
+CMD ["node", "main.js"]
