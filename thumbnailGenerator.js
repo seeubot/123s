@@ -15,49 +15,174 @@ class ThumbnailGenerator {
     }
   }
 
-  // Main method to generate thumbnails
-  async generateThumbnails(fileUrl, videoInfo) {
-    console.log('Starting thumbnail generation process');
+  // Main method to generate multiple thumbnails for selection
+  async generateSelectionThumbnails(fileUrl, videoInfo) {
+    console.log('Starting thumbnail selection generation');
     
     try {
-      // First try to get video information if not provided
+      // Get video information if not provided
       if (!videoInfo || !videoInfo.duration) {
         videoInfo = await this.getVideoMetadata(fileUrl);
         console.log('Retrieved video metadata:', videoInfo);
       }
       
-      // Method 1: Try extract embedded thumbnail with proper conversion
-      console.log('Trying to extract embedded thumbnail with format conversion');
-      const embeddedThumbnail = await this.extractEmbeddedThumbnailWithConversion(fileUrl);
+      // Generate thumbnails at start, middle, and end
+      const selectionThumbnails = await this.generatePositionedThumbnails(fileUrl, videoInfo);
       
-      if (embeddedThumbnail) {
-        console.log('Successfully extracted and converted embedded thumbnail');
-        return [embeddedThumbnail];
+      if (selectionThumbnails && selectionThumbnails.length > 0) {
+        console.log(`Generated ${selectionThumbnails.length} thumbnails for selection`);
+        return selectionThumbnails;
       }
       
-      // Method 2: Try to generate thumbnails with improved approach
-      console.log('Trying thumbnails with improved method');
-      const thumbnails = await this.generateImprovedThumbnails(fileUrl, videoInfo);
+      // If standard method fails, try embedded + fallback approach
+      console.log('Positioned thumbnails failed, trying alternative methods');
+      const alternativeThumbnails = await this.generateAlternativeThumbnails(fileUrl, videoInfo);
       
-      if (thumbnails && thumbnails.length > 0) {
-        return thumbnails;
+      return alternativeThumbnails;
+    } catch (error) {
+      console.error('Fatal error in thumbnail selection generation:', error);
+      return [];
+    }
+  }
+  
+  // Generate thumbnails at specific positions (start, middle, end)
+  async generatePositionedThumbnails(fileUrl, videoInfo) {
+    const { duration } = videoInfo || { duration: 10 };
+    const thumbnails = [];
+    
+    // Define positions for start, middle, and end
+    const positions = [
+      Math.max(1, Math.min(duration * 0.1, 3)),            // Start (10% in or 3 seconds, whichever is less)
+      Math.max(2, Math.min(duration * 0.5, duration / 2)), // Middle (50%)
+      Math.max(3, Math.min(duration * 0.9, duration - 3))  // End (90% or 3 seconds from end)
+    ];
+    
+    // Set position labels
+    const positionLabels = ['start', 'middle', 'end'];
+    
+    // Generate a thumbnail for each position
+    for (let i = 0; i < positions.length; i++) {
+      const position = positions[i];
+      const label = positionLabels[i];
+      
+      const thumbnailPath = path.join(this.tempDir, `${label}-thumbnail-${uuidv4()}.jpg`);
+      
+      try {
+        // Try to generate the thumbnail with optimal settings
+        await this._runFfmpegCommand([
+          '-ss', position.toString(),   // Seek position
+          '-i', fileUrl,                // Input file
+          '-vframes', '1',              // Extract one frame
+          '-vf', 'scale=320:-1',        // Scale to width 320px
+          '-f', 'image2',               // Force image format
+          '-q:v', '2',                  // High quality
+          thumbnailPath                 // Output path
+        ], 30000);
+        
+        // Validate the thumbnail
+        if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 100) {
+          // Save metadata about the thumbnail
+          thumbnails.push({
+            path: thumbnailPath,
+            position: label,
+            timestamp: position,
+            index: i
+          });
+          
+          console.log(`Successfully generated ${label} thumbnail at position ${position}`);
+        } else {
+          console.log(`Generated ${label} thumbnail was invalid, trying alternative method`);
+          
+          // Try alternative method with different settings
+          await this._runFfmpegCommand([
+            '-i', fileUrl,              // Input first
+            '-ss', position.toString(), // Then seek (sometimes more reliable)
+            '-vframes', '1',            // Extract one frame
+            '-vf', 'scale=320:-1',      // Scale to width 320px
+            '-f', 'image2',             // Force image format
+            '-q:v', '3',                // Slightly lower quality
+            thumbnailPath               // Output path
+          ], 30000);
+          
+          if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 100) {
+            thumbnails.push({
+              path: thumbnailPath,
+              position: label,
+              timestamp: position,
+              index: i
+            });
+            
+            console.log(`Successfully generated ${label} thumbnail with alternative method`);
+          } else {
+            console.log(`Failed to generate ${label} thumbnail`);
+            this.cleanupThumbnails([thumbnailPath]);
+          }
+        }
+      } catch (error) {
+        console.error(`Error generating ${label} thumbnail:`, error);
+        this.cleanupThumbnails([thumbnailPath]);
       }
-      
-      // Method 3: Create a blank thumbnail with text as fallback
-      console.log('All thumbnail methods failed, creating fallback thumbnail');
+    }
+    
+    // If we have at least one thumbnail, consider it a success
+    return thumbnails;
+  }
+  
+  // Generate alternative thumbnails if positioned approach fails
+  async generateAlternativeThumbnails(fileUrl, videoInfo) {
+    const thumbnails = [];
+    
+    // Try to extract embedded thumbnail
+    console.log('Trying to extract embedded thumbnail');
+    const embeddedThumbnail = await this.extractEmbeddedThumbnailWithConversion(fileUrl);
+    
+    if (embeddedThumbnail) {
+      thumbnails.push({
+        path: embeddedThumbnail,
+        position: 'embedded',
+        timestamp: 0,
+        index: 0
+      });
+    }
+    
+    // If we couldn't get any embedded thumbnail, create a fallback
+    if (thumbnails.length === 0) {
+      console.log('Creating fallback thumbnail');
       const fallbackThumbnail = await this.createFallbackThumbnail(videoInfo);
       
       if (fallbackThumbnail) {
-        return [fallbackThumbnail];
+        thumbnails.push({
+          path: fallbackThumbnail,
+          position: 'fallback',
+          timestamp: 0,
+          index: 0
+        });
       }
-      
-      // If we reach here, all methods failed
-      console.error('All thumbnail generation methods failed');
-      return null;
-    } catch (error) {
-      console.error('Fatal error in thumbnail generation:', error);
-      return null;
     }
+    
+    return thumbnails;
+  }
+  
+  // Create a Telegram inline keyboard for thumbnail selection
+  createThumbnailSelectionKeyboard(thumbnails) {
+    // Create buttons for each thumbnail
+    const keyboard = thumbnails.map(thumbnail => {
+      const position = thumbnail.position.charAt(0).toUpperCase() + thumbnail.position.slice(1);
+      return [{
+        text: `Select ${position} Thumbnail`,
+        callback_data: `select_thumbnail:${thumbnail.index}`
+      }];
+    });
+    
+    // Add a cancel button
+    keyboard.push([{
+      text: 'Cancel Selection',
+      callback_data: 'cancel_thumbnail_selection'
+    }]);
+    
+    return {
+      inline_keyboard: keyboard
+    };
   }
   
   // Get video metadata if not provided
@@ -191,78 +316,6 @@ class ThumbnailGenerator {
       console.error('Error in extractEmbeddedThumbnailWithConversion:', error);
       return null;
     }
-  }
-  
-  // Generate thumbnails with improved approach to work with Telegram
-  async generateImprovedThumbnails(fileUrl, videoInfo) {
-    const { duration } = videoInfo || { duration: 10 };
-    const thumbnails = [];
-    
-    // Try different positions in the video
-    const positions = [
-      Math.min(1, duration * 0.1),      // Near start but avoid potential black frames
-      Math.max(2, duration * 0.25),     // 1/4 through
-      Math.max(3, duration * 0.5)       // Middle
-    ];
-    
-    for (const position of positions) {
-      const thumbnailPath = path.join(this.tempDir, `improved-thumbnail-${uuidv4()}.jpg`);
-      
-      try {
-        // Use a more robust approach - seek first, then input
-        await this._runFfmpegCommand([
-          '-ss', position.toString(),   // Seek before input for better accuracy
-          '-i', fileUrl,                // Video file
-          '-vframes', '1',              // Single frame
-          '-vf', 'scale=320:-1',        // Scale to 320px width
-          '-f', 'image2',               // Force image output
-          '-q:v', '2',                  // High quality
-          thumbnailPath                 // Output path
-        ], 30000);
-        
-        // Verify and test if the created thumbnail is valid
-        if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 100) {
-          // Additional validation to ensure it's a valid image
-          try {
-            // Try to re-encode it to confirm it's a valid image
-            const validationPath = path.join(this.tempDir, `validation-${uuidv4()}.jpg`);
-            
-            await this._runFfmpegCommand([
-              '-i', thumbnailPath,
-              '-f', 'image2',
-              validationPath
-            ], 5000);
-            
-            // If validation passes, use this thumbnail
-            if (fs.existsSync(validationPath) && fs.statSync(validationPath).size > 100) {
-              // Use the validated image instead
-              thumbnails.push(validationPath);
-              
-              // Clean up original
-              this.cleanupThumbnails([thumbnailPath]);
-              console.log(`Successfully generated validated thumbnail at position ${position}`);
-              
-              // Break after one successful thumbnail
-              break;
-            } else {
-              console.log(`Generated thumbnail failed validation, trying next position`);
-              this.cleanupThumbnails([thumbnailPath, validationPath]);
-            }
-          } catch (validationError) {
-            console.error(`Thumbnail validation failed:`, validationError);
-            this.cleanupThumbnails([thumbnailPath]);
-          }
-        } else {
-          console.log(`Generated thumbnail was invalid, trying next position`);
-          this.cleanupThumbnails([thumbnailPath]);
-        }
-      } catch (error) {
-        console.error(`Error generating thumbnail at position ${position}:`, error);
-        this.cleanupThumbnails([thumbnailPath]);
-      }
-    }
-    
-    return thumbnails;
   }
   
   // Create a simple fallback thumbnail with text
