@@ -1,12 +1,13 @@
 // Advanced Video Thumbnail Generator Bot for Telegram
 // Features:
 // - Handles videos up to 1GB with optimized processing
-// - Generates thumbnails without full download using chunked streaming
+// - Generates thumbnails without full download using efficient FFmpeg parameters
 // - Admin-only access control
 // - Multiple channel posting options
 // - Inline URL buttons & join channel buttons
 // - Broadcasting capability
 // - HTTP health check server for hosting platform compatibility
+// - Connection conflict resolution
 
 const { Telegraf, Markup } = require('telegraf');
 const fs = require('fs');
@@ -24,7 +25,7 @@ const ffmpeg = require('fluent-ffmpeg');
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 // Get bot token from environment variable or use default
-const BOT_TOKEN = process.env.BOT_TOKEN || '6866329408:AAF8cNWbWwuFk_sf1Yh7Yzh__Vi6t6ZYAG8';
+const BOT_TOKEN = process.env.BOT_TOKEN || '6866329408:AAGbn9Cd6V5f10TcNsec4h9yTposBWd2okI';
 
 // IMPORTANT: Set your channel IDs here
 const CHANNELS = {
@@ -179,7 +180,7 @@ async function processVideoForThumbnails(ctx, userId) {
       userState.thumbnails = thumbnails;
       userState.waitingForThumbnailSelection = true;
       
-      await ctx.reply('Choose one of these thumbnails by replying with the number (1-5):');
+      await ctx.reply('Choose one of these thumbnails by replying with the number (1-' + thumbnails.length + '):');
       
       // Send each thumbnail
       for (let i = 0; i < thumbnails.length; i++) {
@@ -197,6 +198,7 @@ async function processVideoForThumbnails(ctx, userId) {
 }
 
 // Generate thumbnails from video stream without downloading the entire file
+// FIXED: Removed invalid FFmpeg options
 async function generateThumbnailsFromStream(ctx, userId, fileUrl) {
   const userState = userStates[userId];
   const videoDuration = userState.video.duration;
@@ -224,17 +226,11 @@ async function generateThumbnailsFromStream(ctx, userId, fileUrl) {
       const thumbnailPath = path.join(tempDir, `thumbnail-${uuidv4()}.jpg`);
       
       await new Promise((resolve, reject) => {
-        // Use ffmpeg with optimized options for large files
+        // Use ffmpeg with proper options for large files
         const command = ffmpeg(fileUrl)
           .inputOptions([
-            // Start seeking from beginning to ensure we can get any frame
-            `-ss ${timestamp}`,
-            // Read input at lower quality for speed
-            '-quality good',
-            // Limit probing duration
-            '-probesize 5000000',
-            // Fast analyze
-            '-analyzeduration 1000000'
+            // Seek to position before input (faster seeking)
+            `-ss ${timestamp}`
           ])
           .outputOptions([
             // Only get one frame
@@ -275,6 +271,7 @@ async function generateThumbnailsFromStream(ctx, userId, fileUrl) {
 }
 
 // Alternative thumbnail generation method using keyframe extraction
+// FIXED: Removed invalid FFmpeg options
 async function retryThumbnailGeneration(ctx, userId, fileUrl) {
   const userState = userStates[userId];
   
@@ -294,7 +291,6 @@ async function retryThumbnailGeneration(ctx, userId, fileUrl) {
     }
     
     // Generate fewer thumbnails (3) with more focus on the beginning of the video
-    // which is usually faster to access
     const positions = [0.01, 0.1, 0.25]; 
     
     for (let i = 0; i < positions.length; i++) {
@@ -302,27 +298,17 @@ async function retryThumbnailGeneration(ctx, userId, fileUrl) {
       const thumbnailPath = path.join(tempDir, `thumbnail-alt-${uuidv4()}.jpg`);
       
       await new Promise((resolve, reject) => {
-        // Use ffmpeg with even more optimized options for tough cases
+        // Use ffmpeg with simplified options that should work on all versions
         const command = ffmpeg(fileUrl)
           .inputOptions([
             // Seek to beginning
-            `-ss ${position}`,
-            // Set timeout
-            '-timeout 30000000',
-            // Only analyze start of file
-            '-analyzeduration 100000',
-            // Use fast decode
-            '-flags +fastseek'
+            `-ss ${position}`
           ])
           .outputOptions([
-            // Just get the keyframes
-            '-skip_frame nokey',
             // Just one frame
             '-frames:v 1',
             // Resize
-            `-s ${width}x${height}`,
-            // Good quality
-            '-q:v 3'
+            `-s ${width}x${height}`
           ])
           .output(thumbnailPath);
         
@@ -612,35 +598,60 @@ bot.catch((err, ctx) => {
   }
 });
 
-// Start HTTP server first, then launch the bot
-server.listen(PORT, () => {
-  console.log(`Health check server running on port ${PORT}`);
+// FIXED: Modified launch process with retry and conflict resolution
+let launchAttempts = 0;
+const maxAttempts = 5;
+
+const attemptLaunch = () => {
+  console.log(`Attempt ${launchAttempts + 1} to start the bot...`);
   
-  // Test connection before fully launching
-  console.log('Testing connection to Telegram API...');
   bot.telegram.getMe()
     .then(botInfo => {
       console.log(`Connection successful! Bot info:`, botInfo);
       console.log(`Bot name: ${botInfo.first_name}, Username: @${botInfo.username}`);
       
-      // Start the bot after successful connection test
-      console.log('Starting bot...');
-      return bot.launch();
+      // Add launch options to avoid polling conflicts
+      const launchOptions = {
+        dropPendingUpdates: true // This ignores all pending updates when bot starts
+      };
+      
+      return bot.launch(launchOptions);
     })
     .then(() => {
       console.log('Bot started successfully!');
+      launchAttempts = 0; // Reset attempts counter on success
     })
     .catch(err => {
       console.error('Failed to connect to Telegram API:', err.message);
-      if (err.response) {
+      
+      if (err.message.includes('409: Conflict')) {
+        console.log('Detected conflict with another bot instance. Waiting for it to release...');
+        
+        // Wait 10 seconds before retrying
+        setTimeout(() => {
+          if (launchAttempts < maxAttempts) {
+            launchAttempts++;
+            attemptLaunch();
+          } else {
+            console.error('Maximum retry attempts reached. Please ensure no other bot instances are running and restart manually.');
+            process.exit(1);
+          }
+        }, 10000);
+      } else if (err.response) {
         console.error('Response details:', err.response.data);
+        console.error('\nPossible issues:');
+        console.error('1. Bot token may be invalid - double-check with BotFather');
+        console.error('2. Network connectivity issues');
+        console.error('3. Telegram API might be blocked on your network');
+        process.exit(1);
       }
-      console.error('\nPossible issues:');
-      console.error('1. Bot token may be invalid - double-check with BotFather');
-      console.error('2. Network connectivity issues');
-      console.error('3. Telegram API might be blocked on your network');
-      process.exit(1);
     });
+};
+
+// Start HTTP server first, then launch the bot
+server.listen(PORT, () => {
+  console.log(`Health check server running on port ${PORT}`);
+  attemptLaunch();
 });
 
 // Enhanced error handling for the HTTP server
