@@ -1,22 +1,26 @@
 {
-  "name": "terabox-downloader-bot",
+  "name": "telegram-thumbnail-generator-bot",
   "version": "1.0.0",
-  "description": "Telegram bot to download videos from TeraBox",
+  "description": "Telegram bot that generates thumbnails from videos and posts to channels",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "dev": "nodemon index.js"
-  },
-  "dependencies": {
-    "axios": "^1.3.4",
-    "dotenv": "^16.0.3",
-    "mongodb": "^4.13.0",
-    "telegraf": "^4.12.2"
-  },
-  "devDependencies": {
-    "nodemon": "^2.0.20"
+    "dev": "nodemon index.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
   },
   "engines": {
-    "node": "18.x"
-  }
+    "node": ">=16.0.0"
+  },
+  "dependencies": {
+    "telegraf": "^4.12.2",
+    "axios": "^1.4.0",
+    "ffmpeg-static": "^5.1.0",
+    "fluent-ffmpeg": "^2.1.2",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "nodemon": "^2.0.22"
+  },
+  "author": "",
+  "license": "ISC"
 }
