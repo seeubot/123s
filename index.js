@@ -1,7 +1,7 @@
 // Advanced Video Thumbnail Generator Bot for Telegram
 // Features:
-// - Handles videos up to 1GB
-// - Generates thumbnails without full download
+// - Handles videos up to 1GB with optimized processing
+// - Generates thumbnails without full download using chunked streaming
 // - Admin-only access control
 // - Multiple channel posting options
 // - Inline URL buttons & join channel buttons
@@ -15,6 +15,8 @@ const axios = require('axios');
 const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 const http = require('http');
+const stream = require('stream');
+const { promisify } = require('util');
 
 // Import ffmpeg-static and set it up with fluent-ffmpeg
 const ffmpegPath = require('ffmpeg-static');
@@ -60,7 +62,7 @@ if (!fs.existsSync(tempDir)) {
 // Keep track of user states
 const userStates = {};
 
-// Admin check middleware - FIXED: Now this only applies to feature commands, not /start or /help
+// Admin check middleware - Only applies to feature commands, not /start or /help
 const adminCheckMiddleware = (ctx, next) => {
   const userId = ctx.from.id;
   if (ADMIN_IDS.includes(userId)) {
@@ -134,6 +136,8 @@ bot.on('video', adminCheckMiddleware, async (ctx) => {
       return ctx.reply('Sorry, the video is too large. Maximum allowed size is 1GB.');
     }
 
+    await ctx.reply('Processing your video. This might take a moment for larger files...');
+
     // Store video information in user state
     userStates[userId] = {
       video: video,
@@ -155,24 +159,40 @@ bot.on('video', adminCheckMiddleware, async (ctx) => {
   }
 });
 
-// Process videos for thumbnail generation using stream processing
+// Process videos for thumbnail generation with improved streaming and fallback mechanisms
 async function processVideoForThumbnails(ctx, userId) {
   const userState = userStates[userId];
   const video = userState.video;
   
   try {
-    ctx.reply('Processing your video to generate thumbnails...');
+    ctx.reply('Analyzing video and preparing thumbnail extraction...');
     
     // Get file info from Telegram
     const fileInfo = await ctx.telegram.getFile(video.file_id);
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
     
-    // Generate thumbnails directly from the stream
-    await generateThumbnailsFromStream(ctx, userId, fileUrl);
+    // First attempt: Direct stream processing
+    const thumbnails = await generateThumbnailsFromStream(ctx, userId, fileUrl);
+    
+    if (thumbnails && thumbnails.length > 0) {
+      // Successfully generated thumbnails
+      userState.thumbnails = thumbnails;
+      userState.waitingForThumbnailSelection = true;
+      
+      await ctx.reply('Choose one of these thumbnails by replying with the number (1-5):');
+      
+      // Send each thumbnail
+      for (let i = 0; i < thumbnails.length; i++) {
+        await ctx.replyWithPhoto({ source: thumbnails[i] }, { caption: `Thumbnail ${i + 1}` });
+      }
+    } else {
+      // If direct streaming failed, try alternative method
+      await retryThumbnailGeneration(ctx, userId, fileUrl);
+    }
   } catch (error) {
     console.error('Error processing video for thumbnails:', error);
-    // If any error occurs, fall back to manual thumbnail upload
-    handleThumbnailGenerationError(ctx, userId);
+    // Try alternative thumbnail generation method
+    await retryThumbnailGeneration(ctx, userId, fileUrl);
   }
 }
 
@@ -181,12 +201,6 @@ async function generateThumbnailsFromStream(ctx, userId, fileUrl) {
   const userState = userStates[userId];
   const videoDuration = userState.video.duration;
   const aspectRatio = userState.aspectRatio;
-  
-  ctx.reply('Generating thumbnails while preserving the original aspect ratio...');
-  
-  // Generate 5 thumbnails at different positions in the video
-  const thumbnails = [];
-  const timestamps = [0.1, 0.25, 0.5, 0.75, 0.9].map(fraction => videoDuration * fraction);
   
   try {
     // Calculate dimensions preserving aspect ratio
@@ -199,29 +213,53 @@ async function generateThumbnailsFromStream(ctx, userId, fileUrl) {
       width = Math.round(height * aspectRatio);
     }
     
-    // Generate thumbnails
+    // Generate 5 thumbnails at different positions in the video
+    const thumbnails = [];
+    const timestamps = [0.1, 0.25, 0.5, 0.75, 0.9].map(fraction => 
+      Math.min(videoDuration * fraction, videoDuration - 1)
+    );
+    
     for (let i = 0; i < timestamps.length; i++) {
       const timestamp = timestamps[i];
       const thumbnailPath = path.join(tempDir, `thumbnail-${uuidv4()}.jpg`);
       
       await new Promise((resolve, reject) => {
-        // Use ffmpeg to extract a frame directly from the stream
-        ffmpeg(fileUrl)
+        // Use ffmpeg with optimized options for large files
+        const command = ffmpeg(fileUrl)
           .inputOptions([
-            // Seek to position before input to speed up extraction
-            `-ss ${timestamp}`
+            // Start seeking from beginning to ensure we can get any frame
+            `-ss ${timestamp}`,
+            // Read input at lower quality for speed
+            '-quality good',
+            // Limit probing duration
+            '-probesize 5000000',
+            // Fast analyze
+            '-analyzeduration 1000000'
           ])
           .outputOptions([
-            // Only read a small portion of the file
+            // Only get one frame
             '-frames:v 1',
-            `-s ${width}x${height}`
+            // Set output size
+            `-s ${width}x${height}`,
+            // High quality JPG
+            '-q:v 2'
           ])
-          .output(thumbnailPath)
+          .output(thumbnailPath);
+        
+        // Add timeout handling
+        const timeout = setTimeout(() => {
+          command.kill('SIGKILL');
+          reject(new Error('Thumbnail generation timed out'));
+        }, 60000); // 60 second timeout
+        
+        command
           .on('end', () => {
+            clearTimeout(timeout);
             thumbnails.push(thumbnailPath);
             resolve();
           })
           .on('error', (err) => {
+            clearTimeout(timeout);
             console.error(`Error generating thumbnail ${i + 1}:`, err);
             reject(err);
           })
@@ -229,20 +267,102 @@ async function generateThumbnailsFromStream(ctx, userId, fileUrl) {
       });
     }
     
-    // Send thumbnails to user and ask to choose one
-    ctx.reply('Choose one of these thumbnails by replying with the number (1-5):');
-    
-    // Store thumbnails in user state
-    userState.thumbnails = thumbnails;
-    userState.waitingForThumbnailSelection = true;
-    
-    // Send each thumbnail
-    for (let i = 0; i < thumbnails.length; i++) {
-      await ctx.replyWithPhoto({ source: thumbnails[i] }, { caption: `Thumbnail ${i + 1}` });
-    }
+    return thumbnails;
   } catch (thumbnailError) {
-    console.error('Error generating thumbnails:', thumbnailError);
-    // Error in thumbnail generation, ask user to upload an image
+    console.error('Error in thumbnail generation:', thumbnailError);
+    return null;
+  }
+}
+
+// Alternative thumbnail generation method using keyframe extraction
+async function retryThumbnailGeneration(ctx, userId, fileUrl) {
+  const userState = userStates[userId];
+  
+  try {
+    await ctx.reply('Using alternative thumbnail extraction method for your large video...');
+    
+    const thumbnails = [];
+    
+    // Calculate dimensions preserving aspect ratio
+    const aspectRatio = userState.aspectRatio;
+    let width = 320;
+    let height = Math.round(width / aspectRatio);
+    
+    if (height > 240) {
+      height = 240;
+      width = Math.round(height * aspectRatio);
+    }
+    
+    // Generate fewer thumbnails (3) with more focus on the beginning of the video
+    // which is usually faster to access
+    const positions = [0.01, 0.1, 0.25]; 
+    
+    for (let i = 0; i < positions.length; i++) {
+      const position = positions[i];
+      const thumbnailPath = path.join(tempDir, `thumbnail-alt-${uuidv4()}.jpg`);
+      
+      await new Promise((resolve, reject) => {
+        // Use ffmpeg with even more optimized options for tough cases
+        const command = ffmpeg(fileUrl)
+          .inputOptions([
+            // Seek to beginning
+            `-ss ${position}`,
+            // Set timeout
+            '-timeout 30000000',
+            // Only analyze start of file
+            '-analyzeduration 100000',
+            // Use fast decode
+            '-flags +fastseek'
+          ])
+          .outputOptions([
+            // Just get the keyframes
+            '-skip_frame nokey',
+            // Just one frame
+            '-frames:v 1',
+            // Resize
+            `-s ${width}x${height}`,
+            // Good quality
+            '-q:v 3'
+          ])
+          .output(thumbnailPath);
+        
+        const timeout = setTimeout(() => {
+          command.kill('SIGKILL');
+          reject(new Error('Alternative thumbnail generation timed out'));
+        }, 60000);
+        
+        command
+          .on('end', () => {
+            clearTimeout(timeout);
+            thumbnails.push(thumbnailPath);
+            resolve();
+          })
+          .on('error', (err) => {
+            clearTimeout(timeout);
+            console.error(`Error in alternative thumbnail generation ${i + 1}:`, err);
+            reject(err);
+          })
+          .run();
+      });
+    }
+    
+    if (thumbnails.length > 0) {
+      userState.thumbnails = thumbnails;
+      userState.waitingForThumbnailSelection = true;
+      
+      await ctx.reply('Choose one of these thumbnails by replying with the number (1-' + thumbnails.length + '):');
+      
+      // Send each thumbnail
+      for (let i = 0; i < thumbnails.length; i++) {
+        await ctx.replyWithPhoto({ source: thumbnails[i] }, { caption: `Thumbnail ${i + 1}` });
+      }
+    } else {
+      // If both methods fail, ask for manual upload
+      handleThumbnailGenerationError(ctx, userId);
+    }
+  } catch (error) {
+    console.error('Error in alternative thumbnail generation:', error);
+    // Last resort - ask for manual upload
     handleThumbnailGenerationError(ctx, userId);
   }
 }
@@ -432,9 +552,9 @@ bot.on('photo', adminCheckMiddleware, async (ctx) => {
   }
 });
 
-// Handle errors in thumbnail generation
+// Improved error handling in thumbnail generation
 function handleThumbnailGenerationError(ctx, userId) {
-  ctx.reply('I couldn\'t generate thumbnails from your video. Please upload an image to use as a thumbnail.');
+  ctx.reply('I was unable to automatically extract thumbnails from your video due to its size or format. Please upload an image to use as a thumbnail instead.');
   
   // Update user state
   userStates[userId].waitingForManualThumbnail = true;
