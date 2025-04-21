@@ -4,8 +4,7 @@
   "description": "Telegram bot for generating thumbnails from videos",
   "main": "botMain.js",
   "scripts": {
-    "start": "node botMain.js",
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "start": "node botMain.js"
   },
   "engines": {
     "node": ">=16.0.0"
@@ -13,7 +12,6 @@
   "dependencies": {
     "telegraf": "^4.12.2",
     "uuid": "^9.0.0",
-    "canvas": "^2.11.2",
     "axios": "^1.4.0",
     "ffmpeg-static": "^5.1.0"
   },
