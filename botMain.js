@@ -5,29 +5,24 @@ const os = require('os');
 const { v4: uuidv4 } = require('uuid');
 const http = require('http');
 
-// Import our thumbnail generator module
+// Import our modules
 const ThumbnailGenerator = require('./thumbnailGenerator');
+const FallbackHandler = require('./fallbackHandler');
 
 // Get bot token from environment variable or use default
 const BOT_TOKEN = process.env.BOT_TOKEN || '6866329408:AAE7bPEHzZQf2Dh6ccidxxJsWtD-Qj6GKdo';
 
-// IMPORTANT: Set your channel IDs here
+// Set your channel IDs here
 const CHANNELS = {
   STUFF: '@dailydiskwala',
-  MOVIE: '@diskmoviee' // Replace with your movie channel ID
+  MOVIE: '@diskmoviee'
 };
 
-// IMPORTANT: List of admin user IDs who can use the bot
+// List of admin user IDs who can use the bot
 const ADMIN_IDS = [
-  1352497419, // Replace with actual admin Telegram IDs
-  1352497419  // Add more admin IDs as needed
+  1352497419,
+  1352497419
 ];
-
-// Check if the token is a placeholder
-if (BOT_TOKEN === 'YOUR_ACTUAL_BOT_TOKEN_HERE') {
-  console.error('Error: Please replace the placeholder with your actual bot token!');
-  process.exit(1);
-}
 
 // Debug token to verify it's in the correct format
 console.log(`Token starting with: ${BOT_TOKEN.substring(0, 5)}... (length: ${BOT_TOKEN.length})`);
@@ -36,8 +31,9 @@ console.log(`Token starting with: ${BOT_TOKEN.substring(0, 5)}... (length: ${BOT
 const bot = new Telegraf(BOT_TOKEN);
 const tempDir = path.join(os.tmpdir(), 'telegram-thumbnails');
 
-// Initialize thumbnail generator
+// Initialize our modules
 const thumbnailGenerator = new ThumbnailGenerator(tempDir);
+const fallbackHandler = new FallbackHandler(tempDir);
 
 // Maximum accepted video size (1GB)
 const MAX_VIDEO_SIZE = 1024 * 1024 * 1024;
@@ -50,7 +46,7 @@ if (!fs.existsSync(tempDir)) {
 // Keep track of user states
 const userStates = {};
 
-// Admin check middleware - Only applies to feature commands, not /start or /help
+// Admin check middleware
 const adminCheckMiddleware = (ctx, next) => {
   const userId = ctx.from.id;
   if (ADMIN_IDS.includes(userId)) {
@@ -60,7 +56,7 @@ const adminCheckMiddleware = (ctx, next) => {
   }
 };
 
-// Allow anyone to access basic commands
+// Basic commands
 bot.start((ctx) => {
   try {
     console.log(`User ${ctx.from.id} (${ctx.from.username || 'no username'}) started the bot`);
@@ -89,7 +85,7 @@ bot.help((ctx) => {
   }
 });
 
-// Apply admin check to feature commands
+// Admin commands
 bot.command('broadcast', adminCheckMiddleware, async (ctx) => {
   try {
     userStates[ctx.from.id] = {
@@ -105,7 +101,6 @@ bot.command('broadcast', adminCheckMiddleware, async (ctx) => {
 
 bot.command('stats', adminCheckMiddleware, async (ctx) => {
   try {
-    // You can implement actual stats here
     ctx.reply('Bot Statistics:\n- Active since: Bot start time\n- Videos processed: Count\n- Posts made: Count');
   } catch (error) {
     console.error('Error in stats command:', error);
@@ -113,41 +108,42 @@ bot.command('stats', adminCheckMiddleware, async (ctx) => {
   }
 });
 
-// Handle incoming videos - apply admin check
+// Handle incoming videos
 bot.on('video', adminCheckMiddleware, async (ctx) => {
   try {
     const video = ctx.message.video;
     const userId = ctx.from.id;
     
-    // Check file size (limit to 1GB)
+    // Check file size
     if (video.file_size > MAX_VIDEO_SIZE) {
       return ctx.reply('Sorry, the video is too large. Maximum allowed size is 1GB.');
     }
 
-    await ctx.reply('Processing your video. This might take a moment for larger files...');
+    await ctx.reply('Processing your video. This may take a moment...');
 
-    // Store video information in user state
+    // Store video information
     userStates[userId] = {
       video: video,
       videoId: video.file_id,
       videoName: video.file_name || 'video.mp4',
       videoWidth: video.width,
       videoHeight: video.height,
-      aspectRatio: video.width / video.height
+      aspectRatio: video.width / video.height,
+      duration: video.duration
     };
     
-    // Process the video thumbnail generation
+    // Process the video
     await processVideoForThumbnails(ctx, userId);
   } catch (error) {
     console.error('Error handling video:', error);
     ctx.reply('Sorry, there was an error processing your video. Please try again or upload a different video.');
     
-    // Clean up any temporary files
+    // Clean up
     cleanupTempFiles(userId);
   }
 });
 
-// Process videos for thumbnail generation using our external module
+// Process videos with improved error handling
 async function processVideoForThumbnails(ctx, userId) {
   const userState = userStates[userId];
   const video = userState.video;
@@ -159,31 +155,69 @@ async function processVideoForThumbnails(ctx, userId) {
     const fileInfo = await ctx.telegram.getFile(video.file_id);
     const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
     
-    // Use our thumbnail generator module
+    // Video info for thumbnail generation
     const videoInfo = {
       duration: video.duration,
       width: video.width,
-      height: video.height
+      height: video.height,
+      file_name: video.file_name,
+      file_size: video.file_size
     };
     
-    const thumbnails = await thumbnailGenerator.generateThumbnails(fileUrl, videoInfo);
+    // Try to generate thumbnails
+    let thumbnails = await thumbnailGenerator.generateThumbnails(fileUrl, videoInfo);
+    
+    // If thumbnails generation failed completely, try fallbacks
+    if (!thumbnails || thumbnails.length === 0) {
+      console.log('Main thumbnail generation failed, trying fallbacks');
+      
+      // Try to extract Telegram's own thumbnail first
+      const telegramThumbnail = await fallbackHandler.extractVideoThumbnail(ctx.telegram, video.file_id);
+      
+      if (telegramThumbnail) {
+        thumbnails = [telegramThumbnail];
+      } else {
+        // Try creating a placeholder as final resort
+        const placeholderThumbnail = await fallbackHandler.generatePlaceholderThumbnail(video.file_name);
+        
+        if (placeholderThumbnail) {
+          thumbnails = [placeholderThumbnail];
+        }
+      }
+    }
     
     if (thumbnails && thumbnails.length > 0) {
-      // Successfully generated thumbnails
+      // Successfully generated or obtained thumbnails
       userState.thumbnails = thumbnails;
       userState.waitingForThumbnailSelection = true;
       
-      await ctx.reply('Choose one of these thumbnails by replying with the number (1-' + thumbnails.length + '):');
-      
-      // Send each thumbnail with its number
-      for (let i = 0; i < thumbnails.length; i++) {
+      // If only one thumbnail, skip selection
+      if (thumbnails.length === 1) {
+        userState.selectedThumbnail = thumbnails[0];
+        userState.waitingForThumbnailSelection = false;
+        userState.waitingForUrl = true;
+        
         await ctx.replyWithPhoto(
-          { source: thumbnails[i] }, 
-          { caption: `Thumbnail ${i + 1}` }
+          { source: thumbnails[0] },
+          { caption: 'Only one thumbnail could be generated. I\'ll use this one!' }
         );
+        
+        // Ask for URL
+        ctx.reply('Now please send me the URL to include with this post:');
+      } else {
+        // Multiple thumbnails, ask for selection
+        await ctx.reply('Choose one of these thumbnails by replying with the number (1-' + thumbnails.length + '):');
+        
+        // Send thumbnails
+        for (let i = 0; i < thumbnails.length; i++) {
+          await ctx.replyWithPhoto(
+            { source: thumbnails[i] }, 
+            { caption: `Thumbnail ${i + 1}` }
+          );
+        }
       }
     } else {
-      // If thumbnail generation failed, ask for manual upload
+      // All generation methods failed, ask for manual upload
       await handleThumbnailGenerationError(ctx, userId);
     }
   } catch (error) {
@@ -193,17 +227,16 @@ async function processVideoForThumbnails(ctx, userId) {
   }
 }
 
-// Handle text messages - apply admin check only for users in specific state
+// Handle text messages
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const userState = userStates[userId];
   
-  // If not in a state, only admins should get a response
+  // Check if user is in a known state
   if (!userState && !ADMIN_IDS.includes(userId)) {
     return ctx.reply('Please use /start to begin using the bot.');
   }
   
-  // If we have a state, this user is already authenticated
   if (!userState) return;
   
   try {
@@ -230,6 +263,7 @@ bot.on('text', async (ctx) => {
       return;
     }
     
+    // Handle thumbnail selection
     if (userState.waitingForThumbnailSelection) {
       const choice = parseInt(ctx.message.text);
       
@@ -307,7 +341,7 @@ async function postToChannel(ctx, userId) {
     const channelUrl = `https://t.me/${channelId.replace('@', '')}`;
     
     const inlineKeyboard = Markup.inlineKeyboard([
-      [Markup.button.url('Link mawa', userState.url)],
+      [Markup.button.url('Visit Website', userState.url)],
       [Markup.button.url(joinButton, channelUrl)]
     ]);
     
@@ -331,7 +365,7 @@ async function postToChannel(ctx, userId) {
   }
 }
 
-// Handle manual thumbnail upload - apply admin check
+// Handle manual thumbnail upload
 bot.on('photo', adminCheckMiddleware, async (ctx) => {
   const userId = ctx.from.id;
   const userState = userStates[userId];
@@ -341,7 +375,7 @@ bot.on('photo', adminCheckMiddleware, async (ctx) => {
     const fileId = photo.file_id;
     
     try {
-      // Use our thumbnail generator module to download the photo
+      // Download the manually uploaded thumbnail
       const thumbnailPath = await thumbnailGenerator.downloadThumbnailFromTelegram(fileId, BOT_TOKEN);
       
       if (thumbnailPath) {
@@ -363,9 +397,9 @@ bot.on('photo', adminCheckMiddleware, async (ctx) => {
   }
 });
 
-// Improved error handling in thumbnail generation
+// Error handling for thumbnail generation
 async function handleThumbnailGenerationError(ctx, userId) {
-  ctx.reply('I was unable to automatically extract thumbnails from your video due to its format or size. Please upload an image to use as a thumbnail instead.');
+  ctx.reply('I was unable to automatically extract thumbnails from your video. Please upload an image to use as a thumbnail instead.');
   
   // Update user state
   userStates[userId].waitingForManualThumbnail = true;
@@ -378,7 +412,7 @@ function cleanupTempFiles(userId) {
   
   if (!userState) return;
   
-  // Use our thumbnail generator to clean up thumbnails
+  // Clean up thumbnails
   if (userState.thumbnails) {
     thumbnailGenerator.cleanupThumbnails(userState.thumbnails);
   }
@@ -415,95 +449,56 @@ bot.catch((err, ctx) => {
   }
 });
 
-// Modified launch process with retry and conflict resolution
+// Launch bot with retry mechanism
 let launchAttempts = 0;
 const maxAttempts = 5;
 
-const attemptLaunch = () => {
-  console.log(`Attempt ${launchAttempts + 1} to start the bot...`);
-  
-  bot.telegram.getMe()
-    .then(botInfo => {
-      console.log(`Connection successful! Bot info:`, botInfo);
-      console.log(`Bot name: ${botInfo.first_name}, Username: @${botInfo.username}`);
-      
-      // Add launch options to avoid polling conflicts
-      const launchOptions = {
-        dropPendingUpdates: true // This ignores all pending updates when bot starts
-      };
-      
-      return bot.launch(launchOptions);
-    })
-    .then(() => {
-      console.log('Bot started successfully!');
-      launchAttempts = 0; // Reset attempts counter on success
-    })
-    .catch(err => {
-      console.error('Failed to connect to Telegram API:', err.message);
-      
-      if (err.message.includes('409: Conflict')) {
-        console.log('Detected conflict with another bot instance. Waiting for it to release...');
-        
-        // Wait 10 seconds before retrying
-        setTimeout(() => {
-          if (launchAttempts < maxAttempts) {
-            launchAttempts++;
-            attemptLaunch();
-          } else {
-            console.error('Maximum retry attempts reached. Please ensure no other bot instances are running and restart manually.');
-            process.exit(1);
-          }
-        }, 10000);
-      } else if (err.response) {
-        console.error('Response details:', err.response.data);
-        console.error('\nPossible issues:');
-        console.error('1. Bot token may be invalid - double-check with BotFather');
-        console.error('2. Network connectivity issues');
-        console.error('3. Telegram API might be blocked on your network');
-        process.exit(1);
-      }
+const attemptLaunch = async () => {
+  try {
+    console.log(`Attempt ${launchAttempts + 1} to launch bot...`);
+    await bot.launch();
+    console.log('Bot successfully launched!');
+    
+    // Start the HTTP server once bot is launched
+    server.listen(PORT, () => {
+      console.log(`HTTP server running on port ${PORT}`);
     });
+    
+    // Add shutdown handlers
+    process.once('SIGINT', () => {
+      bot.stop('SIGINT');
+      server.close();
+      console.log('Bot stopped due to SIGINT');
+    });
+    process.once('SIGTERM', () => {
+      bot.stop('SIGTERM');
+      server.close();
+      console.log('Bot stopped due to SIGTERM');
+    });
+    
+  } catch (error) {
+    launchAttempts++;
+    console.error(`Failed to launch bot (attempt ${launchAttempts}):`, error);
+    
+    if (launchAttempts < maxAttempts) {
+      const retryDelay = Math.pow(2, launchAttempts) * 1000; // Exponential backoff
+      console.log(`Retrying in ${retryDelay / 1000} seconds...`);
+      setTimeout(attemptLaunch, retryDelay);
+    } else {
+      console.error(`Failed to launch bot after ${maxAttempts} attempts. Giving up.`);
+      process.exit(1);
+    }
+  }
 };
 
-// Start HTTP server first, then launch the bot
-server.listen(PORT, () => {
-  console.log(`Health check server running on port ${PORT}`);
-  attemptLaunch();
-});
+// Start the launch sequence
+console.log('Starting Telegram thumbnail generator bot...');
+attemptLaunch();
 
-// Enhanced error handling for the HTTP server
-server.on('error', (err) => {
-  console.error('HTTP server error:', err);
-  if (err.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use. Try a different port.`);
-    process.exit(1);
-  }
-});
-
-// Enable graceful stop
-process.once('SIGINT', () => {
-  console.log('Received SIGINT. Shutting down gracefully...');
-  bot.stop('SIGINT');
-  server.close(() => {
-    console.log('HTTP server closed.');
-  });
-});
-
-process.once('SIGTERM', () => {
-  console.log('Received SIGTERM. Shutting down gracefully...');
-  bot.stop('SIGTERM');
-  server.close(() => {
-    console.log('HTTP server closed.');
-  });
-});
-
-// Handle uncaught exceptions and unhandled promise rejections to prevent crashes
-process.on('uncaughtException', (err) => {
-  console.error('Uncaught exception:', err);
-  // Don't exit process, just log the error
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  console.error('Unhandled Rejection at:', promise, 'reason:', reason);
-  // Don't exit process, just log the error
-});
+// Export modules for testing if needed
+module.exports = {
+  bot,
+  server,
+  thumbnailGenerator,
+  fallbackHandler
+};
