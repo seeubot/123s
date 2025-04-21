@@ -1,11 +1,27 @@
-version: '3'
+version: '3.8'
 
 services:
-  telegram-bot:
+  bot:
     build: .
-    restart: always
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - MONGODB_URI=mongodb://mongo:27017/telegram-bot
+    ports:
+      - "8000:8000"
     volumes:
-      - ./temp:/app/temp
-      - ./data:/app/data
-    env_file:
-      - .env
+      - ./logs:/usr/src/app/logs
+    depends_on:
+      - mongo
+
+  mongo:
+    image: mongo:5
+    restart: unless-stopped
+    volumes:
+      - mongo-data:/data/db
+    ports:
+      - "27017:27017"
+
+volumes:
+  mongo-data:
