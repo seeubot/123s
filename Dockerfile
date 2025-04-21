@@ -1,35 +1,29 @@
-# Use multi-stage build for more efficiency
-FROM node:16-slim AS builder
+FROM node:16-bullseye
 
 WORKDIR /app
 
-# Copy package files
-COPY package.json ./
-
-# Install all dependencies (including dev dependencies)
-RUN npm install
-
-# Use lean production image
-FROM node:16-slim
-
-# Install required dependencies for ffmpeg
+# Install system dependencies for canvas
 RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    python3 \
     build-essential \
+    libcairo2-dev \
+    libpango1.0-dev \
+    libjpeg-dev \
+    libgif-dev \
+    librsvg2-dev \
+    && apt-get clean \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+# Copy package.json and package-lock.json
+COPY package*.json ./
 
-# Copy package files and installed node modules
-COPY --from=builder /app/node_modules ./node_modules
-COPY package.json ./
+# Install dependencies
+RUN npm install
 
-# Copy source code
+# Copy the rest of the application
 COPY . .
 
-# Create temp directory for thumbnails
-RUN mkdir -p /tmp/telegram-thumbnails && chmod 777 /tmp/telegram-thumbnails
+# Expose the port
+EXPOSE 8000
 
 # Start the application
-CMD ["node", "botMain.js"]
+CMD ["npm", "start"]
