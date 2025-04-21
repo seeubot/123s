@@ -32,4 +32,4 @@ COPY . .
 RUN mkdir -p /tmp/telegram-thumbnails && chmod 777 /tmp/telegram-thumbnails
 
 # Start the application
-CMD ["node", "index.js"]
+CMD ["node", "botMain.js"]
