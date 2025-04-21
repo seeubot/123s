@@ -24,7 +24,7 @@ const ffmpeg = require('fluent-ffmpeg');
 ffmpeg.setFfmpegPath(ffmpegPath);
 
 // Get bot token from environment variable or use default
-const BOT_TOKEN = process.env.BOT_TOKEN || '6866329408:AAGbn9Cd6V5f10TcNsec4h9yTposBWd2okI';
+const BOT_TOKEN = process.env.BOT_TOKEN || '6866329408:AAF8cNWbWwuFk_sf1Yh7Yzh__Vi6t6ZYAG8';
 
 // IMPORTANT: Set your channel IDs here
 const CHANNELS = {
