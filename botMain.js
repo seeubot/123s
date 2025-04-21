@@ -438,7 +438,36 @@ const server = http.createServer((req, res) => {
   res.end('Bot is running!\n');
 });
 
-// Handle errors in both the HTTP server and the bot
+// Start the HTTP server first to ensure health checks pass
+console.log(`Starting HTTP server on port ${PORT}...`);
+server.listen(PORT, () => {
+  console.log(`HTTP server running on port ${PORT}`);
+  
+  // Start the bot only after HTTP server is running
+  startBot();
+});
+
+// Handle errors in the HTTP server
+server.on('error', (err) => {
+  console.error('HTTP server error:', err);
+  if (err.code === 'EADDRINUSE') {
+    console.error(`Port ${PORT} is already in use. The bot may already be running or another service is using this port.`);
+    console.log('Attempting to choose a different port...');
+    // Try a different port
+    server.close();
+    const newPort = PORT + 1;
+    console.log(`Trying port ${newPort}...`);
+    server.listen(newPort, () => {
+      console.log(`HTTP server now running on port ${newPort}`);
+      startBot();
+    });
+  } else {
+    console.error('Fatal error with HTTP server. Exiting.');
+    process.exit(1);
+  }
+});
+
+// Handle bot errors
 bot.catch((err, ctx) => {
   console.error(`Bot error for ${ctx.updateType}:`, err);
   // Try to notify user of error
@@ -449,51 +478,55 @@ bot.catch((err, ctx) => {
   }
 });
 
-// Launch bot with retry mechanism
-let launchAttempts = 0;
-const maxAttempts = 5;
+// Separate function to start the bot
+function startBot() {
+  // Launch bot with retry mechanism
+  let launchAttempts = 0;
+  const maxAttempts = 5;
 
-const attemptLaunch = async () => {
-  try {
-    console.log(`Attempt ${launchAttempts + 1} to launch bot...`);
-    await bot.launch();
-    console.log('Bot successfully launched!');
-    
-    // Start the HTTP server once bot is launched
-    server.listen(PORT, () => {
-      console.log(`HTTP server running on port ${PORT}`);
-    });
-    
-    // Add shutdown handlers
-    process.once('SIGINT', () => {
-      bot.stop('SIGINT');
-      server.close();
-      console.log('Bot stopped due to SIGINT');
-    });
-    process.once('SIGTERM', () => {
-      bot.stop('SIGTERM');
-      server.close();
-      console.log('Bot stopped due to SIGTERM');
-    });
-    
-  } catch (error) {
-    launchAttempts++;
-    console.error(`Failed to launch bot (attempt ${launchAttempts}):`, error);
-    
-    if (launchAttempts < maxAttempts) {
-      const retryDelay = Math.pow(2, launchAttempts) * 1000; // Exponential backoff
-      console.log(`Retrying in ${retryDelay / 1000} seconds...`);
-      setTimeout(attemptLaunch, retryDelay);
-    } else {
-      console.error(`Failed to launch bot after ${maxAttempts} attempts. Giving up.`);
-      process.exit(1);
+  const attemptLaunch = async () => {
+    try {
+      console.log(`Attempt ${launchAttempts + 1} to launch bot...`);
+      await bot.launch();
+      console.log('Bot successfully launched!');
+      
+      // Add shutdown handlers
+      process.once('SIGINT', () => {
+        bot.stop('SIGINT');
+        server.close();
+        console.log('Bot stopped due to SIGINT');
+      });
+      process.once('SIGTERM', () => {
+        bot.stop('SIGTERM');
+        server.close();
+        console.log('Bot stopped due to SIGTERM');
+      });
+      
+    } catch (error) {
+      launchAttempts++;
+      console.error(`Failed to launch bot (attempt ${launchAttempts}):`, error);
+      
+      if (launchAttempts < maxAttempts) {
+        const retryDelay = Math.pow(2, launchAttempts) * 1000; // Exponential backoff
+        console.log(`Retrying in ${retryDelay / 1000} seconds...`);
+        setTimeout(attemptLaunch, retryDelay);
+      } else {
+        console.error(`Failed to launch bot after ${maxAttempts} attempts. Giving up.`);
+        process.exit(1);
+      }
     }
-  }
-};
+  };
 
-// Start the launch sequence
-console.log('Starting Telegram thumbnail generator bot...');
-attemptLaunch();
+  // Start the launch sequence
+  console.log('Starting Telegram thumbnail generator bot...');
+  attemptLaunch();
+}
+
+// Keep the process alive
+process.on('uncaughtException', (err) => {
+  console.error('Uncaught exception:', err);
+  // Don't exit, try to keep running
+});
 
 // Export modules for testing if needed
 module.exports = {
