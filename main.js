@@ -426,7 +426,7 @@ async function postToChannel(ctx, userId) {
     const channelUrl = `https://t.me/${channelId.replace('@', '')}`;
     
     const inlineKeyboard = Markup.inlineKeyboard([
-      [Markup.button.url('Visit Website', userState.url)],
+      [Markup.button.url('Link mawas', userState.url)],
       [Markup.button.url(joinButton, channelUrl)]
     ]);
     
