@@ -1,17 +1,25 @@
-FROM python:3.10-slim
+FROM node:16-slim
 
-# Set working directory
+# Install required dependencies for ffmpeg
+RUN apt-get update && apt-get install -y \
+    ca-certificates \
+    python3 \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+# Copy package.json and package-lock.json first to leverage Docker cache
+COPY package*.json ./
 
-# Copy project files
+# Install dependencies
+RUN npm ci --only=production
+
+# Copy the rest of the application
 COPY . .
 
-# Create temp directory
-RUN mkdir -p temp/history
+# Create temp directory for thumbnails
+RUN mkdir -p /tmp/telegram-thumbnails && chmod 777 /tmp/telegram-thumbnails
 
-# Run the bot
-CMD ["python", "bot.py"]
+# Start the application
+CMD ["npm", "start"]
