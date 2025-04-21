@@ -1,3 +1,15 @@
+# Use multi-stage build for more efficiency
+FROM node:16-slim AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY package.json ./
+
+# Install all dependencies (including dev dependencies)
+RUN npm install
+
+# Use lean production image
 FROM node:16-slim
 
 # Install required dependencies for ffmpeg
@@ -9,17 +21,15 @@ RUN apt-get update && apt-get install -y \
 
 WORKDIR /app
 
-# Copy package.json and package-lock.json first to leverage Docker cache
-COPY package*.json ./
+# Copy package files and installed node modules
+COPY --from=builder /app/node_modules ./node_modules
+COPY package.json ./
 
-# Install dependencies
-RUN npm ci --only=production
-
-# Copy the rest of the application
+# Copy source code
 COPY . .
 
 # Create temp directory for thumbnails
 RUN mkdir -p /tmp/telegram-thumbnails && chmod 777 /tmp/telegram-thumbnails
 
 # Start the application
-CMD ["npm", "start"]
+CMD ["node", "index.js"]
