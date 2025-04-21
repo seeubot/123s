@@ -33,7 +33,7 @@ const CHANNELS = {
 // IMPORTANT: List of admin user IDs who can use the bot
 const ADMIN_IDS = [
   1352497419, // Replace with actual admin Telegram IDs
-  987654321  // Add more admin IDs as needed
+  1352497419  // Add more admin IDs as needed
 ];
 
 // Check if the token is a placeholder
@@ -60,7 +60,7 @@ if (!fs.existsSync(tempDir)) {
 // Keep track of user states
 const userStates = {};
 
-// Admin check middleware
+// Admin check middleware - FIXED: Now this only applies to feature commands, not /start or /help
 const adminCheckMiddleware = (ctx, next) => {
   const userId = ctx.from.id;
   if (ADMIN_IDS.includes(userId)) {
@@ -70,47 +70,61 @@ const adminCheckMiddleware = (ctx, next) => {
   }
 };
 
-// Apply admin check to all messages
-bot.use(adminCheckMiddleware);
-
-// Handle the /start command
+// Allow anyone to access basic commands
 bot.start((ctx) => {
-  ctx.reply('Welcome to Admin Thumbnail Generator Bot! Send me a video file (up to 1GB), and I\'ll generate thumbnails for you.');
+  try {
+    console.log(`User ${ctx.from.id} (${ctx.from.username || 'no username'}) started the bot`);
+    ctx.reply('Welcome to Admin Thumbnail Generator Bot! Send me a video file (up to 1GB), and I\'ll generate thumbnails for you.');
+  } catch (error) {
+    console.error('Error in start command:', error);
+  }
 });
 
-// Handle the /help command
 bot.help((ctx) => {
-  ctx.reply(
-    'This bot generates thumbnails from your videos and can post to channels. Here\'s how to use it:\n\n' +
-    '1. Send a video file (up to 1GB)\n' +
-    '2. I\'ll generate thumbnails without downloading the whole video\n' +
-    '3. Choose one as your final thumbnail\n' +
-    '4. I\'ll ask for a URL and caption\n' +
-    '5. Select which channel to post to\n' +
-    '6. I\'ll post everything to the channel with URL buttons\n\n' +
-    'Admin commands:\n' +
-    '/broadcast - Send message to all channels\n' +
-    '/stats - View bot usage statistics'
-  );
+  try {
+    ctx.reply(
+      'This bot generates thumbnails from your videos and can post to channels. Here\'s how to use it:\n\n' +
+      '1. Send a video file (up to 1GB)\n' +
+      '2. I\'ll generate thumbnails without downloading the whole video\n' +
+      '3. Choose one as your final thumbnail\n' +
+      '4. I\'ll ask for a URL and caption\n' +
+      '5. Select which channel to post to\n' +
+      '6. I\'ll post everything to the channel with URL buttons\n\n' +
+      'Admin commands:\n' +
+      '/broadcast - Send message to all channels\n' +
+      '/stats - View bot usage statistics'
+    );
+  } catch (error) {
+    console.error('Error in help command:', error);
+  }
 });
 
-// Handle the /broadcast command
-bot.command('broadcast', async (ctx) => {
-  userStates[ctx.from.id] = {
-    waitingForBroadcastMessage: true
-  };
-  
-  ctx.reply('Please send the message you want to broadcast to all channels.');
+// Apply admin check to feature commands
+bot.command('broadcast', adminCheckMiddleware, async (ctx) => {
+  try {
+    userStates[ctx.from.id] = {
+      waitingForBroadcastMessage: true
+    };
+    
+    ctx.reply('Please send the message you want to broadcast to all channels.');
+  } catch (error) {
+    console.error('Error in broadcast command:', error);
+    ctx.reply('An error occurred while processing your command. Please try again.');
+  }
 });
 
-// Handle the /stats command
-bot.command('stats', async (ctx) => {
-  // You can implement actual stats here
-  ctx.reply('Bot Statistics:\n- Active since: Bot start time\n- Videos processed: Count\n- Posts made: Count');
+bot.command('stats', adminCheckMiddleware, async (ctx) => {
+  try {
+    // You can implement actual stats here
+    ctx.reply('Bot Statistics:\n- Active since: Bot start time\n- Videos processed: Count\n- Posts made: Count');
+  } catch (error) {
+    console.error('Error in stats command:', error);
+    ctx.reply('An error occurred while processing your command. Please try again.');
+  }
 });
 
-// Handle incoming videos
-bot.on('video', async (ctx) => {
+// Handle incoming videos - apply admin check
+bot.on('video', adminCheckMiddleware, async (ctx) => {
   try {
     const video = ctx.message.video;
     const userId = ctx.from.id;
@@ -233,71 +247,82 @@ async function generateThumbnailsFromStream(ctx, userId, fileUrl) {
   }
 }
 
-// Handle thumbnail selection
+// Handle text messages - apply admin check only for users in specific state
 bot.on('text', async (ctx) => {
   const userId = ctx.from.id;
   const userState = userStates[userId];
   
-  if (!userState) return;
-  
-  // Handle broadcast message
-  if (userState.waitingForBroadcastMessage) {
-    const broadcastMessage = ctx.message.text;
-    userState.waitingForBroadcastMessage = false;
-    
-    ctx.reply('Broadcasting message to all channels...');
-    
-    // Send broadcast to all channels
-    for (const [channelName, channelId] of Object.entries(CHANNELS)) {
-      try {
-        await ctx.telegram.sendMessage(
-          channelId,
-          broadcastMessage
-        );
-      } catch (error) {
-        console.error(`Error broadcasting to ${channelName}:`, error);
-      }
-    }
-    
-    ctx.reply('Broadcast completed!');
-    return;
+  // If not in a state, only admins should get a response
+  if (!userState && !ADMIN_IDS.includes(userId)) {
+    return ctx.reply('Please use /start to begin using the bot.');
   }
   
-  if (userState.waitingForThumbnailSelection) {
-    const choice = parseInt(ctx.message.text);
-    
-    if (isNaN(choice) || choice < 1 || choice > userState.thumbnails.length) {
-      return ctx.reply(`Please enter a valid number between 1 and ${userState.thumbnails.length}.`);
+  // If we have a state, this user is already authenticated
+  if (!userState) return;
+  
+  try {
+    // Handle broadcast message
+    if (userState.waitingForBroadcastMessage) {
+      const broadcastMessage = ctx.message.text;
+      userState.waitingForBroadcastMessage = false;
+      
+      ctx.reply('Broadcasting message to all channels...');
+      
+      // Send broadcast to all channels
+      for (const [channelName, channelId] of Object.entries(CHANNELS)) {
+        try {
+          await ctx.telegram.sendMessage(
+            channelId,
+            broadcastMessage
+          );
+        } catch (error) {
+          console.error(`Error broadcasting to ${channelName}:`, error);
+        }
+      }
+      
+      ctx.reply('Broadcast completed!');
+      return;
     }
     
-    const selectedThumbnail = userState.thumbnails[choice - 1];
-    userState.selectedThumbnail = selectedThumbnail;
-    userState.waitingForThumbnailSelection = false;
-    userState.waitingForUrl = true;
-    
-    // Ask for URL
-    ctx.reply('Great! Now please send me the URL to include with this post:');
-    
-  } else if (userState.waitingForUrl) {
-    // Save URL and ask for caption
-    userState.url = ctx.message.text;
-    userState.waitingForUrl = false;
-    userState.waitingForCaption = true;
-    
-    ctx.reply('Thanks! Now please send me the caption for this post:');
-    
-  } else if (userState.waitingForCaption) {
-    // Save caption and ask which channel to post to
-    userState.caption = ctx.message.text;
-    userState.waitingForCaption = false;
-    userState.waitingForChannelSelection = true;
-    
-    // Create keyboard with channel options
-    const channelKeyboard = Markup.inlineKeyboard([
-      [Markup.button.callback('STUFF', 'channel_STUFF'), Markup.button.callback('MOVIE', 'channel_MOVIE')]
-    ]);
-    
-    ctx.reply('Select which channel to post to:', channelKeyboard);
+    if (userState.waitingForThumbnailSelection) {
+      const choice = parseInt(ctx.message.text);
+      
+      if (isNaN(choice) || choice < 1 || choice > userState.thumbnails.length) {
+        return ctx.reply(`Please enter a valid number between 1 and ${userState.thumbnails.length}.`);
+      }
+      
+      const selectedThumbnail = userState.thumbnails[choice - 1];
+      userState.selectedThumbnail = selectedThumbnail;
+      userState.waitingForThumbnailSelection = false;
+      userState.waitingForUrl = true;
+      
+      // Ask for URL
+      ctx.reply('Great! Now please send me the URL to include with this post:');
+      
+    } else if (userState.waitingForUrl) {
+      // Save URL and ask for caption
+      userState.url = ctx.message.text;
+      userState.waitingForUrl = false;
+      userState.waitingForCaption = true;
+      
+      ctx.reply('Thanks! Now please send me the caption for this post:');
+      
+    } else if (userState.waitingForCaption) {
+      // Save caption and ask which channel to post to
+      userState.caption = ctx.message.text;
+      userState.waitingForCaption = false;
+      userState.waitingForChannelSelection = true;
+      
+      // Create keyboard with channel options
+      const channelKeyboard = Markup.inlineKeyboard([
+        [Markup.button.callback('STUFF', 'channel_STUFF'), Markup.button.callback('MOVIE', 'channel_MOVIE')]
+      ]);
+      
+      ctx.reply('Select which channel to post to:', channelKeyboard);
+    }
+  } catch (error) {
+    console.error('Error handling text message:', error);
+    ctx.reply('Sorry, an error occurred. Please try again.');
   }
 });
 
@@ -360,8 +385,8 @@ async function postToChannel(ctx, userId) {
   }
 }
 
-// Handle manual thumbnail upload
-bot.on('photo', async (ctx) => {
+// Handle manual thumbnail upload - apply admin check
+bot.on('photo', adminCheckMiddleware, async (ctx) => {
   const userId = ctx.from.id;
   const userState = userStates[userId];
   
@@ -426,14 +451,22 @@ function cleanupTempFiles(userId) {
   if (userState.thumbnails) {
     userState.thumbnails.forEach(thumbnail => {
       if (fs.existsSync(thumbnail)) {
-        fs.unlinkSync(thumbnail);
+        try {
+          fs.unlinkSync(thumbnail);
+        } catch (err) {
+          console.error(`Error deleting thumbnail file ${thumbnail}:`, err);
+        }
       }
     });
   }
   
   // Delete selected thumbnail if exists
   if (userState.selectedThumbnail && fs.existsSync(userState.selectedThumbnail)) {
-    fs.unlinkSync(userState.selectedThumbnail);
+    try {
+      fs.unlinkSync(userState.selectedThumbnail);
+    } catch (err) {
+      console.error(`Error deleting selected thumbnail file ${userState.selectedThumbnail}:`, err);
+    }
   }
   
   // Clear user state
@@ -446,6 +479,17 @@ const server = http.createServer((req, res) => {
   res.statusCode = 200;
   res.setHeader('Content-Type', 'text/plain');
   res.end('Bot is running!\n');
+});
+
+// Handle errors in both the HTTP server and the bot
+bot.catch((err, ctx) => {
+  console.error(`Bot error for ${ctx.updateType}:`, err);
+  // Try to notify user of error
+  try {
+    ctx.reply('Sorry, an error occurred processing your request. Please try again.');
+  } catch (replyErr) {
+    console.error('Error sending error notification:', replyErr);
+  }
 });
 
 // Start HTTP server first, then launch the bot
@@ -469,12 +513,13 @@ server.listen(PORT, () => {
     .catch(err => {
       console.error('Failed to connect to Telegram API:', err.message);
       if (err.response) {
-        console.error('Response details:', err.response);
+        console.error('Response details:', err.response.data);
       }
       console.error('\nPossible issues:');
       console.error('1. Bot token may be invalid - double-check with BotFather');
       console.error('2. Network connectivity issues');
       console.error('3. Telegram API might be blocked on your network');
+      process.exit(1);
     });
 });
 
