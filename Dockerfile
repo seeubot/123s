@@ -1,28 +1,23 @@
-FROM node:16-slim
+FROM node:18-slim
 
-WORKDIR /app
+# Install FFmpeg
+RUN apt-get update && apt-get install -y ffmpeg && rm -rf /var/lib/apt/lists/*
 
-# Install only the necessary ffmpeg dependencies
-RUN apt-get update && apt-get install -y \
-    ffmpeg \
-    fonts-dejavu \
-    && apt-get clean \
-    && rm -rf /var/lib/apt/lists/*
+# Create app directory
+WORKDIR /usr/src/app
 
-# Copy package.json and package-lock.json
+# Install app dependencies
 COPY package*.json ./
+RUN npm ci --only=production
 
-# Install dependencies
-RUN npm install
-
-# Copy the rest of the application
+# Bundle app source
 COPY . .
 
-# Expose the port
-EXPOSE 8000
+# Create directory for logs
+RUN mkdir -p logs && chown -R node:node logs
 
-# Set environment variables
-ENV NODE_ENV=production
+# Switch to non-root user
+USER node
 
 # Start the application
-CMD ["node", "main.js"]
+CMD ["node", "app.js"]
