@@ -1,29 +1,20 @@
-name: telegram-channel-bot
-service:
-  name: telegram-channel-bot
-  type: web
-  ports:
-    - port: 8080
-      protocol: http
-  env:
-    - name: TELEGRAM_BOT_TOKEN
-      value: "6866329408:AAGDH0KcMlGAo9ZX3D4qzBQiuEcO42FoEyQ"
-    - name: MAIN_CHANNEL
-      value: "terao2"
-    - name: MOVIES_CHANNEL
-      value: "@your_movies_channel" 
-    - name: STUFF_CHANNEL
-      value: "@your_stuff_channel"
-  routes:
-    - path: /
-      public: true
-  scaling:
-    min: 1
-    max: 1
-  image:
-    name: telegram-channel-bot
-    registry: docker
-    dockerfile: Dockerfile
-    build_args:
-      - name: TELEGRAM_BOT_TOKEN
-        value: "6866329408:AAGDH0KcMlGAo9ZX3D4qzBQiuEcO42FoEyQ"
+name: telegram-thumbnail-generator-bot
+services:
+  - name: telegram-bot
+    type: web
+    runtime: nodejs16
+    git:
+      repository: YOURGITREPO/telegram-thumbnail-generator-bot
+      branch: main
+    build:
+      builder: dockerfile
+    ports:
+      - port: 8080
+    env:
+      - name: NODE_ENV
+        value: production
+      - name: BOT_TOKEN
+        value: 6866329408:AAGbn9Cd6V5f10TcNsec4h9yTposBWd2okI
+    scaling:
+      min: 1
+      max: 1
