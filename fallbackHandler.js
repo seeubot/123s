@@ -1,7 +1,6 @@
 const fs = require('fs');
 const path = require('path');
 const { v4: uuidv4 } = require('uuid');
-const { createCanvas } = require('canvas');
 const axios = require('axios');
 const ffmpegPath = require('ffmpeg-static');
 const { spawn } = require('child_process');
@@ -134,60 +133,107 @@ class FallbackHandler {
     }
   }
   
-  // Generate placeholder thumbnail with video name when everything else fails
+  // Generate text-based thumbnail using ffmpeg (replaces canvas-based approach)
   async generatePlaceholderThumbnail(videoName) {
     try {
-      console.log('Generating placeholder thumbnail');
+      console.log('Generating ffmpeg text-based placeholder thumbnail');
       const thumbnailPath = path.join(this.tempDir, `placeholder-thumbnail-${uuidv4()}.jpg`);
       
-      // Create a canvas for the placeholder
-      const canvas = createCanvas(640, 360);
-      const ctx = canvas.getContext('2d');
+      // Create a safe version of the video name (escape special characters)
+      const safeName = (videoName || 'Unknown Video').replace(/['"]/g, '');
       
-      // Fill background
-      ctx.fillStyle = '#000000';
-      ctx.fillRect(0, 0, 640, 360);
-      
-      // Add gradient
-      const gradient = ctx.createLinearGradient(0, 0, 640, 360);
-      gradient.addColorStop(0, '#303030');
-      gradient.addColorStop(1, '#101010');
-      ctx.fillStyle = gradient;
-      ctx.fillRect(0, 0, 640, 360);
-      
-      // Draw video icon
-      ctx.fillStyle = '#ffffff';
-      ctx.beginPath();
-      ctx.moveTo(300, 150);
-      ctx.lineTo(360, 180);
-      ctx.lineTo(300, 210);
-      ctx.closePath();
-      ctx.fill();
-      
-      // Add text
-      ctx.font = '24px Arial';
-      ctx.fillStyle = '#ffffff';
-      ctx.textAlign = 'center';
-      ctx.fillText('Video Preview', 320, 270);
-      
-      // Add video name if available
-      if (videoName) {
-        ctx.font = '18px Arial';
-        // Truncate name if too long
-        const displayName = videoName.length > 30 ? 
-          videoName.substring(0, 27) + '...' : 
-          videoName;
-        ctx.fillText(displayName, 320, 300);
-      }
-      
-      // Write to file
-      const buffer = canvas.toBuffer('image/jpeg');
-      fs.writeFileSync(thumbnailPath, buffer);
-      
-      return thumbnailPath;
+      return new Promise((resolve, reject) => {
+        // Create a simple black image with text using ffmpeg
+        const args = [
+          '-f', 'lavfi',
+          '-i', 'color=c=black:s=640x360',
+          '-vf', `drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:text='${safeName}':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=(h-text_h)/2`,
+          '-frames:v', '1',
+          thumbnailPath
+        ];
+        
+        console.log(`Running ffmpeg placeholder generation: ${args.join(' ')}`);
+        
+        const ffmpegProcess = spawn(ffmpegPath, args);
+        
+        let stderrData = '';
+        
+        ffmpegProcess.stderr.on('data', (data) => {
+          stderrData += data.toString();
+        });
+        
+        const timeout = setTimeout(() => {
+          ffmpegProcess.kill('SIGKILL');
+          reject(new Error('FFmpeg placeholder generation timed out'));
+        }, 10000);
+        
+        ffmpegProcess.on('close', (code) => {
+          clearTimeout(timeout);
+          
+          if (code === 0 && fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 0) {
+            resolve(thumbnailPath);
+          } else {
+            console.error(`Failed to generate placeholder, code: ${code}`);
+            console.error(`stderr: ${stderrData}`);
+            
+            // Try a simpler approach as last resort
+            this.generateSimplePlaceholder(thumbnailPath).then(result => {
+              if (result) {
+                resolve(thumbnailPath);
+              } else {
+                resolve(null);
+              }
+            }).catch(() => resolve(null));
+          }
+        });
+        
+        ffmpegProcess.on('error', (err) => {
+          clearTimeout(timeout);
+          console.error('FFmpeg placeholder error:', err);
+          this.generateSimplePlaceholder(thumbnailPath).then(result => {
+            if (result) {
+              resolve(thumbnailPath);
+            } else {
+              resolve(null);
+            }
+          }).catch(() => resolve(null));
+        });
+      });
     } catch (error) {
       console.error('Error generating placeholder thumbnail:', error);
       return null;
+    }
+  }
+  
+  // Super simple placeholder generation as a last resort
+  async generateSimplePlaceholder(outputPath) {
+    try {
+      // Create a very basic black image
+      const args = [
+        '-f', 'lavfi',
+        '-i', 'color=c=black:s=320x240:d=1',
+        '-frames:v', '1',
+        outputPath
+      ];
+      
+      return new Promise((resolve) => {
+        const ffmpegProcess = spawn(ffmpegPath, args);
+        
+        ffmpegProcess.on('close', (code) => {
+          if (code === 0 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
+            resolve(true);
+          } else {
+            resolve(false);
+          }
+        });
+        
+        ffmpegProcess.on('error', () => {
+          resolve(false);
+        });
+      });
+    } catch (error) {
+      console.error('Error in simple placeholder:', error);
+      return false;
     }
   }
   
