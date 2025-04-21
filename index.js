@@ -19,9 +19,8 @@ const ffmpegPath = require('ffmpeg-static');
 const ffmpeg = require('fluent-ffmpeg');
 ffmpeg.setFfmpegPath(ffmpegPath);
 
-// IMPORTANT: Replace this with your actual bot token from BotFather
-// Format should be like: 123456789:ABCDefGhIJKlmNoPQRsTUVwxyZ
-const BOT_TOKEN = '6866329408:AAGbn9Cd6V5f10TcNsec4h9yTposBWd2okI';
+// Get bot token from environment variable or use default
+const BOT_TOKEN = process.env.BOT_TOKEN || '6866329408:AAGbn9Cd6V5f10TcNsec4h9yTposBWd2okI';
 
 // IMPORTANT: Set your channel IDs here
 const CHANNELS = {
