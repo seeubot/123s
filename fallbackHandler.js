@@ -1,300 +1,194 @@
 const fs = require('fs');
 const path = require('path');
+const { createCanvas, loadImage } = require('canvas');
 const { v4: uuidv4 } = require('uuid');
-const axios = require('axios');
-const ffmpegPath = require('ffmpeg-static');
-const { spawn } = require('child_process');
+const { logActivity, logError } = require('./utils/logger');
 
+/**
+ * Class to handle fallback thumbnail generation when the main method fails
+ */
 class FallbackHandler {
+  /**
+   * Constructor
+   * @param {string} tempDir - Directory to store temporary files
+   */
   constructor(tempDir) {
     this.tempDir = tempDir;
     
     // Create temp directory if it doesn't exist
-    if (!fs.existsSync(tempDir)) {
-      fs.mkdirSync(tempDir, { recursive: true });
+    if (!fs.existsSync(this.tempDir)) {
+      fs.mkdirSync(this.tempDir, { recursive: true });
     }
+    
+    logActivity(`FallbackHandler initialized with tempDir: ${this.tempDir}`);
   }
   
-  // Extract video thumbnail from Telegram
+  /**
+   * Extract Telegram's own thumbnail from video
+   * @param {Object} telegram - Telegram context object
+   * @param {string} fileId - File ID of the video
+   * @returns {Promise<string>} - Path to the downloaded thumbnail
+   */
   async extractVideoThumbnail(telegram, fileId) {
     try {
-      console.log('Trying to extract Telegram\'s own thumbnail');
-      const thumbnailPath = path.join(this.tempDir, `telegram-thumbnail-${uuidv4()}.jpg`);
+      logActivity(`Trying to extract Telegram's thumbnail for file ${fileId}`);
       
       // Get file info
-      const fileInfo = await telegram.getFile(fileId);
-     
-      // Try to download Telegram's auto-generated thumbnail if it exists
-      if (fileInfo && fileInfo.thumbnail) {
-        const thumbnailFileId = fileInfo.thumbnail.file_id;
-        const thumbnailInfo = await telegram.getFile(thumbnailFileId);
+      const file = await telegram.getFile(fileId);
+      
+      if (file && file.thumbnail) {
+        // Telegram generated a thumbnail
+        const thumbFileId = file.thumbnail.file_id;
+        const thumbFile = await telegram.getFile(thumbFileId);
         
-        if (thumbnailInfo && thumbnailInfo.file_path) {
+        if (thumbFile && thumbFile.file_path) {
           // Download the thumbnail
-          const downloadUrl = `https://api.telegram.org/file/bot${telegram.token}/${thumbnailInfo.file_path}`;
-          const writer = fs.createWriteStream(thumbnailPath);
+          const outputPath = path.join(this.tempDir, `telegram_thumb_${uuidv4()}.jpg`);
+          const fileUrl = `https://api.telegram.org/file/bot${telegram.token}/${thumbFile.file_path}`;
           
-          const response = await axios({
-            method: 'GET',
-            url: downloadUrl,
-            responseType: 'stream',
-            timeout: 10000 // 10 second timeout
-          });
+          await this.downloadFile(fileUrl, outputPath);
+          logActivity(`Successfully extracted Telegram thumbnail: ${outputPath}`);
           
-          response.data.pipe(writer);
-          
-          await new Promise((resolve, reject) => {
-            writer.on('finish', resolve);
-            writer.on('error', reject);
-          });
-          
-          // Verify file was created successfully
-          if (fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 0) {
-            return thumbnailPath;
-          }
+          return outputPath;
         }
       }
       
-      // If we get here, try to use ffmpeg to extract the first frame
-      return await this.extractFirstFrame(fileInfo, thumbnailPath);
+      logActivity('No Telegram thumbnail found for the video');
+      return null;
     } catch (error) {
-      console.error('Error extracting video thumbnail from Telegram:', error);
+      logError('Error extracting Telegram thumbnail:', error);
       return null;
     }
   }
   
-  // Extract first frame as fallback
-  async extractFirstFrame(fileInfo, outputPath) {
-    try {
-      if (!fileInfo || !fileInfo.file_path) {
-        return null;
-      }
-      
-      const fileUrl = `https://api.telegram.org/file/bot${process.env.BOT_TOKEN}/${fileInfo.file_path}`;
-      
-      return new Promise((resolve, reject) => {
-        // Use very conservative settings
-        const args = [
-          '-ss', '0',           // Start at the beginning
-          '-i', fileUrl,        // Input file
-          '-vframes', '1',      // Extract 1 frame
-          '-vf', 'scale=240:-1', // Lower resolution
-          '-q:v', '5',          // Medium quality
-          outputPath            // Output file
-        ];
-        
-        console.log(`Running ffmpeg first frame extraction: ${ffmpegPath} ${args.join(' ')}`);
-        
-        const ffmpegProcess = spawn(ffmpegPath, [
-          '-threads', '1',      // Use only one thread
-          ...args
-        ]);
-        
-        let stderrData = '';
-        
-        ffmpegProcess.stderr.on('data', (data) => {
-          stderrData += data.toString();
-        });
-        
-        // Set a timeout to kill the process if it takes too long
-        const timeout = setTimeout(() => {
-          console.log('First frame extraction timed out, killing ffmpeg');
-          ffmpegProcess.kill('SIGKILL');
-          reject(new Error('FFmpeg process timed out'));
-        }, 15000);
-        
-        ffmpegProcess.on('close', (code) => {
-          clearTimeout(timeout);
-          
-          if (code === 0) {
-            // Check if file exists and has content
-            if (fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
-              resolve(outputPath);
-            } else {
-              console.log('First frame extraction produced empty file');
-              resolve(null);
-            }
-          } else {
-            console.error(`FFmpeg exited with code ${code}`);
-            console.error(`stderr: ${stderrData}`);
-            resolve(null); // Resolve with null to continue with other methods
-          }
-        });
-        
-        ffmpegProcess.on('error', (err) => {
-          clearTimeout(timeout);
-          console.error('FFmpeg spawn error:', err);
-          resolve(null); // Resolve with null to continue with other methods
-        });
-      });
-    } catch (error) {
-      console.error('Error extracting first frame:', error);
-      return null;
-    }
-  }
-  
-  // Generate text-based thumbnail using ffmpeg (replaces canvas-based approach)
+  /**
+   * Generate a placeholder thumbnail with text
+   * @param {string} videoName - Name of the video for display
+   * @returns {Promise<string>} - Path to the generated placeholder
+   */
   async generatePlaceholderThumbnail(videoName) {
     try {
-      console.log('Generating ffmpeg text-based placeholder thumbnail');
-      const thumbnailPath = path.join(this.tempDir, `placeholder-thumbnail-${uuidv4()}.jpg`);
+      logActivity(`Generating placeholder thumbnail for ${videoName}`);
       
-      // Create a safe version of the video name (escape special characters)
-      const safeName = (videoName || 'Unknown Video').replace(/['"]/g, '');
+      // Create a filename-safe version of the video name
+      const safeVideoName = videoName.replace(/[^a-z0-9]/gi, '_').toLowerCase();
+      const outputPath = path.join(this.tempDir, `placeholder_${safeVideoName}_${uuidv4()}.jpg`);
       
-      return new Promise((resolve, reject) => {
-        // Create a simple black image with text using ffmpeg
-        const args = [
-          '-f', 'lavfi',
-          '-i', 'color=c=black:s=640x360',
-          '-vf', `drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:text='${safeName}':fontcolor=white:fontsize=24:x=(w-text_w)/2:y=(h-text_h)/2`,
-          '-frames:v', '1',
-          thumbnailPath
-        ];
-        
-        console.log(`Running ffmpeg placeholder generation: ${args.join(' ')}`);
-        
-        const ffmpegProcess = spawn(ffmpegPath, args);
-        
-        let stderrData = '';
-        
-        ffmpegProcess.stderr.on('data', (data) => {
-          stderrData += data.toString();
-        });
-        
-        const timeout = setTimeout(() => {
-          ffmpegProcess.kill('SIGKILL');
-          reject(new Error('FFmpeg placeholder generation timed out'));
-        }, 10000);
-        
-        ffmpegProcess.on('close', (code) => {
-          clearTimeout(timeout);
-          
-          if (code === 0 && fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 0) {
-            resolve(thumbnailPath);
-          } else {
-            console.error(`Failed to generate placeholder, code: ${code}`);
-            console.error(`stderr: ${stderrData}`);
-            
-            // Try a simpler approach as last resort
-            this.generateSimplePlaceholder(thumbnailPath).then(result => {
-              if (result) {
-                resolve(thumbnailPath);
-              } else {
-                resolve(null);
-              }
-            }).catch(() => resolve(null));
-          }
-        });
-        
-        ffmpegProcess.on('error', (err) => {
-          clearTimeout(timeout);
-          console.error('FFmpeg placeholder error:', err);
-          this.generateSimplePlaceholder(thumbnailPath).then(result => {
-            if (result) {
-              resolve(thumbnailPath);
-            } else {
-              resolve(null);
-            }
-          }).catch(() => resolve(null));
-        });
-      });
+      // Create canvas (16:9 aspect ratio)
+      const width = 1280;
+      const height = 720;
+      const canvas = createCanvas(width, height);
+      const ctx = canvas.getContext('2d');
+      
+      // Fill background
+      ctx.fillStyle = '#1e1e1e';
+      ctx.fillRect(0, 0, width, height);
+      
+      // Add play button
+      ctx.beginPath();
+      ctx.arc(width / 2, height / 2, 50, 0, Math.PI * 2);
+      ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+      ctx.fill();
+      
+      // Draw play triangle
+      ctx.beginPath();
+      ctx.moveTo(width / 2 + 20, height / 2);
+      ctx.lineTo(width / 2 - 10, height / 2 + 15);
+      ctx.lineTo(width / 2 - 10, height / 2 - 15);
+      ctx.closePath();
+      ctx.fillStyle = '#ffffff';
+      ctx.fill();
+      
+      // Draw video name
+      ctx.font = '24px Arial';
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      
+      // Truncate if necessary
+      let displayName = videoName;
+      if (displayName.length > 40) {
+        displayName = displayName.substring(0, 37) + '...';
+      }
+      
+      ctx.fillText(displayName, width / 2, height / 2 + 100);
+      
+      // Save to file
+      const buffer = canvas.toBuffer('image/jpeg', { quality: 0.9 });
+      fs.writeFileSync(outputPath, buffer);
+      
+      logActivity(`Generated placeholder thumbnail: ${outputPath}`);
+      return outputPath;
     } catch (error) {
-      console.error('Error generating placeholder thumbnail:', error);
+      logError('Error generating placeholder thumbnail:', error);
+      return this.generateSimplePlaceholder(); // Fallback to very simple method
+    }
+  }
+  
+  /**
+   * Generate a very simple placeholder as last resort
+   * @returns {Promise<string>} - Path to the generated simple placeholder
+   */
+  async generateSimplePlaceholder() {
+    try {
+      logActivity('Generating simple placeholder as last resort');
+      
+      const outputPath = path.join(this.tempDir, `simple_placeholder_${uuidv4()}.jpg`);
+      
+      // Create a simple canvas
+      const width = 640;
+      const height = 360;
+      const canvas = createCanvas(width, height);
+      const ctx = canvas.getContext('2d');
+      
+      // Fill with gradient
+      const gradient = ctx.createLinearGradient(0, 0, width, height);
+      gradient.addColorStop(0, '#1e3c72');
+      gradient.addColorStop(1, '#2a5298');
+      ctx.fillStyle = gradient;
+      ctx.fillRect(0, 0, width, height);
+      
+      // Add text
+      ctx.font = '24px Arial';
+      ctx.fillStyle = '#ffffff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText('Video Preview', width / 2, height / 2);
+      
+      // Save to file
+      const buffer = canvas.toBuffer('image/jpeg', { quality: 0.8 });
+      fs.writeFileSync(outputPath, buffer);
+      
+      logActivity(`Generated simple placeholder: ${outputPath}`);
+      return outputPath;
+    } catch (error) {
+      logError('Error generating simple placeholder:', error);
       return null;
     }
   }
   
-  // Super simple placeholder generation as a last resort
-  async generateSimplePlaceholder(outputPath) {
-    try {
-      // Create a very basic black image
-      const args = [
-        '-f', 'lavfi',
-        '-i', 'color=c=black:s=320x240:d=1',
-        '-frames:v', '1',
-        outputPath
-      ];
+  /**
+   * Download a file from URL
+   * @param {string} url - URL to download
+   * @param {string} outputPath - Where to save the file
+   * @returns {Promise<void>}
+   */
+  async downloadFile(url, outputPath) {
+    return new Promise((resolve, reject) => {
+      const https = require('https');
+      const file = fs.createWriteStream(outputPath);
       
-      return new Promise((resolve) => {
-        const ffmpegProcess = spawn(ffmpegPath, args);
+      https.get(url, (response) => {
+        response.pipe(file);
         
-        ffmpegProcess.on('close', (code) => {
-          if (code === 0 && fs.existsSync(outputPath) && fs.statSync(outputPath).size > 0) {
-            resolve(true);
-          } else {
-            resolve(false);
-          }
+        file.on('finish', () => {
+          file.close();
+          resolve();
         });
-        
-        ffmpegProcess.on('error', () => {
-          resolve(false);
-        });
+      }).on('error', (err) => {
+        fs.unlink(outputPath, () => {}); // Delete the file on error
+        reject(err);
       });
-    } catch (error) {
-      console.error('Error in simple placeholder:', error);
-      return false;
-    }
-  }
-  
-  // Advanced thumbnail extraction with precise seeking
-  async extractAdvancedThumbnail(fileUrl, videoInfo) {
-    try {
-      const { duration } = videoInfo;
-      const thumbnailPath = path.join(this.tempDir, `advanced-thumbnail-${uuidv4()}.jpg`);
-      
-      // Calculate better thumbnail position (25% into the video)
-      const position = Math.max(1, Math.min(duration * 0.25, duration - 5));
-      
-      return new Promise((resolve, reject) => {
-        // Use more advanced ffmpeg options for better thumbnail extraction
-        const args = [
-          // Fast seeking to approximate position first
-          '-ss', position.toString(),
-          '-i', fileUrl,
-          // Then fine-tune with precise seeking
-          '-frames:v', '1',
-          '-q:v', '2',             // High quality
-          '-vf', 'scale=640:-1',   // Better resolution
-          thumbnailPath
-        ];
-        
-        console.log(`Running advanced thumbnail extraction: ${args.join(' ')}`);
-        
-        const ffmpegProcess = spawn(ffmpegPath, args);
-        
-        let stderrData = '';
-        ffmpegProcess.stderr.on('data', (data) => {
-          stderrData += data.toString();
-        });
-        
-        // Set timeout
-        const timeout = setTimeout(() => {
-          ffmpegProcess.kill('SIGKILL');
-          reject(new Error('Advanced thumbnail extraction timed out'));
-        }, 30000);
-        
-        ffmpegProcess.on('close', (code) => {
-          clearTimeout(timeout);
-          
-          if (code === 0 && fs.existsSync(thumbnailPath) && fs.statSync(thumbnailPath).size > 0) {
-            resolve(thumbnailPath);
-          } else {
-            console.error(`Advanced extraction failed, code: ${code}`);
-            resolve(null);
-          }
-        });
-        
-        ffmpegProcess.on('error', (err) => {
-          clearTimeout(timeout);
-          console.error('FFmpeg advanced extraction error:', err);
-          resolve(null);
-        });
-      });
-    } catch (error) {
-      console.error('Error in advanced thumbnail extraction:', error);
-      return null;
-    }
+    });
   }
 }
 
