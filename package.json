@@ -1,11 +1,10 @@
 {
-  "name": "telegram-thumbnail-generator-bot",
+  "name": "telegram-thumbnail-bot",
   "version": "1.0.0",
-  "description": "Telegram bot that generates thumbnails from videos and posts to channels",
-  "main": "index.js",
+  "description": "Telegram bot for generating thumbnails from videos",
+  "main": "botMain.js",
   "scripts": {
-    "start": "node index.js",
-    "dev": "nodemon index.js",
+    "start": "node botMain.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
   "engines": {
@@ -13,13 +12,10 @@
   },
   "dependencies": {
     "telegraf": "^4.12.2",
+    "uuid": "^9.0.0",
+    "canvas": "^2.11.2",
     "axios": "^1.4.0",
-    "ffmpeg-static": "^5.1.0",
-    "fluent-ffmpeg": "^2.1.2",
-    "uuid": "^9.0.0"
-  },
-  "devDependencies": {
-    "nodemon": "^2.0.22"
+    "ffmpeg-static": "^5.1.0"
   },
   "author": "",
   "license": "ISC"
