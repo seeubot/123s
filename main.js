@@ -13,6 +13,9 @@ const FallbackHandler = require('./fallbackHandler');
 const { UserState } = require('./models/userState');
 const { logActivity, logError } = require('./utils/logger');
 
+// Add Post model import
+const { Post } = require('./models/post');
+
 // Environment variables check
 if (!process.env.BOT_TOKEN) {
   console.error('ERROR: BOT_TOKEN environment variable is not set!');
@@ -52,6 +55,9 @@ const fallbackHandler = new FallbackHandler(tempDir);
 
 // Maximum accepted video size (1GB)
 const MAX_VIDEO_SIZE = 1024 * 1024 * 1024;
+
+// Number of posts per page for listing
+const POSTS_PER_PAGE = 5;
 
 // Create temp directory if it doesn't exist
 if (!fs.existsSync(tempDir)) {
@@ -115,7 +121,10 @@ bot.help((ctx) => {
       '6. I\'ll post everything to the channel with URL buttons\n\n' +
       'Admin commands:\n' +
       '/broadcast - Send message to all channels\n' +
-      '/stats - View bot usage statistics'
+      '/stats - View bot usage statistics\n' +
+      '/posts - List recent posts\n' +
+      '/resend [postId] - Resend a specific post by ID\n' +
+      '/recent [channel] - Show recent posts from a specific channel'
     );
   } catch (error) {
     logError('Error in help command:', error);
@@ -145,11 +154,269 @@ bot.command('broadcast', adminCheckMiddleware, async (ctx) => {
 
 bot.command('stats', adminCheckMiddleware, async (ctx) => {
   try {
-    // TODO: Pull real statistics from database when implemented
-    ctx.reply('Bot Statistics:\n- Active since: Bot start time\n- Videos processed: Count\n- Posts made: Count');
+    // Get post counts from database
+    const totalPosts = await Post.countDocuments();
+    const stuffPosts = await Post.countDocuments({ channelId: CHANNELS.STUFF });
+    const moviePosts = await Post.countDocuments({ channelId: CHANNELS.MOVIE });
+    const recentPosts = await Post.countDocuments({ createdAt: { $gte: new Date(Date.now() - 7 * 24 * 60 * 60 * 1000) } });
+    
+    ctx.reply(
+      'Bot Statistics:\n' +
+      `- Total posts: ${totalPosts}\n` +
+      `- STUFF channel posts: ${stuffPosts}\n` +
+      `- MOVIE channel posts: ${moviePosts}\n` +
+      `- Posts in last 7 days: ${recentPosts}`
+    );
   } catch (error) {
     logError('Error in stats command:', error);
     ctx.reply('An error occurred while processing your command. Please try again.');
+  }
+});
+
+// New command for listing posts
+bot.command('posts', adminCheckMiddleware, async (ctx) => {
+  try {
+    // Extract page number if provided
+    const args = ctx.message.text.split(' ');
+    const page = parseInt(args[1]) || 1;
+    
+    // Calculate skip value for pagination
+    const skip = (page - 1) * POSTS_PER_PAGE;
+    
+    // Get total count for pagination
+    const totalPosts = await Post.countDocuments();
+    const totalPages = Math.ceil(totalPosts / POSTS_PER_PAGE);
+    
+    if (totalPosts === 0) {
+      return ctx.reply('No posts found in the database.');
+    }
+    
+    // Fetch posts with pagination, sorted by newest first
+    const posts = await Post.find()
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(POSTS_PER_PAGE);
+    
+    if (posts.length === 0) {
+      return ctx.reply(`No posts found on page ${page}. Total pages: ${totalPages}`);
+    }
+    
+    // Format the posts list
+    let message = `Posts (Page ${page}/${totalPages}):\n\n`;
+    
+    posts.forEach((post, index) => {
+      const date = post.createdAt.toLocaleDateString();
+      const time = post.createdAt.toLocaleTimeString();
+      const channel = Object.keys(CHANNELS).find(key => CHANNELS[key] === post.channelId) || post.channelId;
+      
+      message += `${index + 1 + skip}. Post ID: ${post.postId}\n`;
+      message += `📝 Caption: ${post.caption.substring(0, 30)}${post.caption.length > 30 ? '...' : ''}\n`;
+      message += `📺 Channel: ${channel}\n`;
+      message += `🕒 Posted: ${date} ${time}\n\n`;
+    });
+    
+    // Add pagination info and instructions
+    message += `Use /posts ${page + 1} to see the next page\n`;
+    message += `Use /resend [postId] to resend a specific post`;
+    
+    ctx.reply(message);
+  } catch (error) {
+    logError('Error in posts command:', error);
+    ctx.reply('An error occurred while retrieving posts. Please try again.');
+  }
+});
+
+// New command for showing recent posts from a specific channel
+bot.command('recent', adminCheckMiddleware, async (ctx) => {
+  try {
+    const args = ctx.message.text.split(' ');
+    const channelName = args[1]?.toUpperCase();
+    const page = parseInt(args[2]) || 1;
+    
+    if (!channelName || !CHANNELS[channelName]) {
+      return ctx.reply(`Please specify a valid channel name: /recent [STUFF|MOVIE] [page]`);
+    }
+    
+    const channelId = CHANNELS[channelName];
+    const skip = (page - 1) * POSTS_PER_PAGE;
+    
+    // Get total count for this channel
+    const totalPosts = await Post.countDocuments({ channelId });
+    const totalPages = Math.ceil(totalPosts / POSTS_PER_PAGE);
+    
+    if (totalPosts === 0) {
+      return ctx.reply(`No posts found for channel ${channelName}.`);
+    }
+    
+    // Fetch posts for this channel
+    const posts = await Post.find({ channelId })
+      .sort({ createdAt: -1 })
+      .skip(skip)
+      .limit(POSTS_PER_PAGE);
+    
+    if (posts.length === 0) {
+      return ctx.reply(`No posts found on page ${page} for channel ${channelName}. Total pages: ${totalPages}`);
+    }
+    
+    // Format the posts list
+    let message = `Recent posts for ${channelName} (Page ${page}/${totalPages}):\n\n`;
+    
+    posts.forEach((post, index) => {
+      const date = post.createdAt.toLocaleDateString();
+      const time = post.createdAt.toLocaleTimeString();
+      
+      message += `${index + 1 + skip}. Post ID: ${post.postId}\n`;
+      message += `📝 Caption: ${post.caption.substring(0, 30)}${post.caption.length > 30 ? '...' : ''}\n`;
+      message += `🔗 URL: ${post.url}\n`;
+      message += `🕒 Posted: ${date} ${time}\n\n`;
+    });
+    
+    // Add pagination info and instructions
+    message += `Use /recent ${channelName} ${page + 1} to see the next page\n`;
+    message += `Use /resend [postId] to resend a specific post`;
+    
+    ctx.reply(message);
+  } catch (error) {
+    logError('Error in recent command:', error);
+    ctx.reply('An error occurred while retrieving channel posts. Please try again.');
+  }
+});
+
+// New command for resending a post
+bot.command('resend', adminCheckMiddleware, async (ctx) => {
+  try {
+    const args = ctx.message.text.split(' ');
+    const postId = args[1];
+    
+    if (!postId) {
+      return ctx.reply('Please provide a post ID: /resend [postId]');
+    }
+    
+    // Find the post in the database
+    const post = await Post.findOne({ postId });
+    
+    if (!post) {
+      return ctx.reply(`Post with ID ${postId} not found.`);
+    }
+    
+    // Send a confirmation with post details and channel selection
+    let message = `Post found! Details:\n\n`;
+    message += `Caption: ${post.caption}\n`;
+    message += `URL: ${post.url}\n`;
+    message += `Original channel: ${Object.keys(CHANNELS).find(key => CHANNELS[key] === post.channelId) || post.channelId}\n\n`;
+    message += `Select destination channel for repost:`;
+    
+    // Create keyboard with channel options
+    const channelKeyboard = Markup.inlineKeyboard([
+      [
+        Markup.button.callback('STUFF', `resend_${postId}_STUFF`), 
+        Markup.button.callback('MOVIE', `resend_${postId}_MOVIE`)
+      ]
+    ]);
+    
+    ctx.reply(message, channelKeyboard);
+  } catch (error) {
+    logError('Error in resend command:', error);
+    ctx.reply('An error occurred while processing your resend request. Please try again.');
+  }
+});
+
+// Handle resend action
+bot.action(/resend_(.+)_(.+)/, adminCheckMiddleware, async (ctx) => {
+  const postId = ctx.match[1];
+  const channelName = ctx.match[2]; // STUFF or MOVIE
+  
+  try {
+    await ctx.answerCbQuery(`Preparing to resend to ${channelName} channel...`);
+    
+    // Find the post in the database
+    const post = await Post.findOne({ postId });
+    
+    if (!post) {
+      return ctx.reply(`Post with ID ${postId} not found.`);
+    }
+    
+    const channelId = CHANNELS[channelName];
+    
+    // Create inline keyboard with URL button and join channel button
+    const joinButton = `Join ${channelName}`;
+    const channelUrl = `https://t.me/${channelId.replace('@', '')}`;
+    
+    const inlineKeyboard = Markup.inlineKeyboard([
+      [Markup.button.url('Link mawas', post.url)],
+      [Markup.button.url(joinButton, channelUrl)]
+    ]);
+    
+    ctx.reply(`Resending post to ${channelName} channel...`);
+    
+    // Check if we have the thumbnail file
+    const thumbnailExists = post.thumbnailPath && fs.existsSync(post.thumbnailPath);
+    let result;
+    
+    if (thumbnailExists) {
+      // Resend with original thumbnail
+      result = await ctx.telegram.sendPhoto(
+        channelId,
+        { source: post.thumbnailPath },
+        { 
+          caption: post.caption,
+          reply_markup: inlineKeyboard.reply_markup
+        }
+      );
+    } else {
+      // If original thumbnail is unavailable, let's try to fetch from Telegram
+      if (post.thumbnailFileId) {
+        try {
+          result = await ctx.telegram.sendPhoto(
+            channelId,
+            post.thumbnailFileId,
+            { 
+              caption: post.caption,
+              reply_markup: inlineKeyboard.reply_markup
+            }
+          );
+        } catch (thumbnailError) {
+          logError('Error resending with thumbnail file ID:', thumbnailError);
+          // If that also fails, send as text
+          result = await ctx.telegram.sendMessage(
+            channelId,
+            `${post.caption}\n\nOriginal post resent by admin.`,
+            { reply_markup: inlineKeyboard.reply_markup }
+          );
+        }
+      } else {
+        // No thumbnail info available, send as text
+        result = await ctx.telegram.sendMessage(
+          channelId,
+          `${post.caption}\n\nOriginal post resent by admin.`,
+          { reply_markup: inlineKeyboard.reply_markup }
+        );
+      }
+    }
+    
+    logActivity(`Resent post ${postId} to ${channelId}`);
+    
+    // Create a new post entry for this resend
+    const newPostId = uuidv4().substring(0, 8);
+    const newPost = new Post({
+      postId: newPostId,
+      caption: post.caption,
+      url: post.url,
+      channelId: channelId,
+      channelName: channelName,
+      thumbnailFileId: result.photo ? result.photo[0].file_id : null,
+      messageId: result.message_id,
+      isResend: true,
+      originalPostId: postId,
+      createdBy: ctx.from.id
+    });
+    
+    await newPost.save();
+    
+    ctx.reply(`Successfully resent post to ${channelId}! New post ID: ${newPostId}`);
+  } catch (error) {
+    logError('Error resending post:', error);
+    ctx.reply('Sorry, there was an error resending the post. Please make sure the bot is an admin in the channel with posting permissions.');
   }
 });
 
@@ -436,7 +703,7 @@ async function postToChannel(ctx, userId) {
     }
     
     // Post photo with caption and inline buttons to channel
-    await ctx.telegram.sendPhoto(
+    const result = await ctx.telegram.sendPhoto(
       channelId,
       { source: userState.selectedThumbnail },
       { 
@@ -446,7 +713,26 @@ async function postToChannel(ctx, userId) {
     );
     
     logActivity(`Posted to ${channelId}`);
-    ctx.reply(`Successfully posted to ${channelId}!`);
+    
+    // Generate a unique post ID for tracking
+    const postId = uuidv4().substring(0, 8);
+    
+    // Save post information to database for future reference
+    const post = new Post({
+      postId: postId,
+      caption: userState.caption,
+      url: userState.url,
+      channelId: channelId,
+      channelName: userState.channelName,
+      thumbnailPath: userState.selectedThumbnail,
+      thumbnailFileId: result.photo[0].file_id, // Store Telegram's file_id for future use
+      messageId: result.message_id,
+      createdBy: userId
+    });
+    
+    await post.save();
+    
+    ctx.reply(`Successfully posted to ${channelId}! Post ID: ${postId}`);
     
     // Clean up
     await cleanupTempFiles(userId);
@@ -533,13 +819,23 @@ async function cleanupTempFiles(userId) {
       }
     }
     
-    // Handle selected thumbnail separately
+    // Note: This is a continuation of the cleanupTempFiles function
+    
+    // Don't delete selected thumbnail if it was saved to a post
+    // Just check if the file exists first
     if (userState.selectedThumbnail && fs.existsSync(userState.selectedThumbnail)) {
-      try {
-        fs.unlinkSync(userState.selectedThumbnail);
-        logActivity(`Deleted selected thumbnail: ${userState.selectedThumbnail}`);
-      } catch (err) {
-        logError(`Error deleting selected thumbnail file ${userState.selectedThumbnail}:`, err);
+      const recentPost = await Post.findOne({ thumbnailPath: userState.selectedThumbnail });
+      
+      if (!recentPost) {
+        // If not used in a post, delete it
+        try {
+          fs.unlinkSync(userState.selectedThumbnail);
+          logActivity(`Deleted selected thumbnail: ${userState.selectedThumbnail}`);
+        } catch (err) {
+          logError(`Error deleting selected thumbnail file ${userState.selectedThumbnail}:`, err);
+        }
+      } else {
+        logActivity(`Kept thumbnail ${userState.selectedThumbnail} as it's used in post ${recentPost.postId}`);
       }
     }
     
