@@ -688,7 +688,7 @@ async function postToChannel(ctx, userId) {
     // Create inline keyboard with URL button and Request Video button
     const inlineKeyboard = Markup.inlineKeyboard([
       [Markup.button.url('Link mawas', userState.url)],
-      [Markup.button.url('Request Video', 'https://t.me/diskwala_bot')]
+      [Markup.button.url('Request Video', 'https://t.me/teraseeubot')]
     ]);
     
     // Verify thumbnail exists
