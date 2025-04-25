@@ -820,100 +820,76 @@ async function cleanupTempFiles(userId) {
       
       if (!recentPost) {
         // If not used in a post, delete it
-        // Continuing from the cleanupTempFiles function...
-    try {
-      fs.unlinkSync(userState.selectedThumbnail);
-      logActivity(`Deleted selected thumbnail: ${userState.selectedThumbnail}`);
-    } catch (err) {
-      logError(`Error deleting selected thumbnail file ${userState.selectedThumbnail}:`, err);
+        try {
+          fs.unlinkSync(userState.selectedThumbnail);
+          logActivity(`Deleted selected thumbnail: ${userState.selectedThumbnail}`);
+        } catch (err) {
+          logError(`Error deleting selected thumbnail file ${userState.selectedThumbnail}:`, err);
+        }
+      }
     }
-  }
     
-  // Reset user state
-  await UserState.findOneAndUpdate(
-    { userId },
-    {
-      $unset: {
-        sessionId: "",
-        videoId: "",
-        videoName: "",
-        videoWidth: "",
-        videoHeight: "",
-        aspectRatio: "",
-        duration: "",
-        thumbnails: "",
-        selectedThumbnail: "",
-        waitingForThumbnailSelection: "",
-        waitingForManualThumbnail: "",
-        waitingForUrl: "",
-        waitingForCaption: "",
-        url: "",
-        caption: "",
-        waitingForChannelSelection: "",
-        selectedChannel: "",
-        channelName: ""
-      },
-      lastUpdated: new Date()
-    }
-  );
-  
-  logActivity(`Cleaned up state for user ${userId}`);
-} catch (error) {
-  logError('Error cleaning up temp files:', error);
-}
-}
-
-// Global error handler middleware
-bot.catch((err, ctx) => {
-  logError('Global error:', err);
-  
-  try {
-    ctx.reply('An unexpected error occurred. Please try again or contact the administrator.');
-  } catch (replyError) {
-    logError('Error sending error message:', replyError);
+    // Reset state but keep userId
+    await UserState.findOneAndUpdate(
+      { userId },
+      {
+        $unset: {
+          sessionId: "",
+          videoId: "",
+          videoName: "",
+          videoWidth: "",
+          videoHeight: "",
+          aspectRatio: "",
+          duration: "",
+          thumbnails: "",
+          selectedThumbnail: "",
+          waitingForThumbnailSelection: "",
+          waitingForManualThumbnail: "",
+          waitingForUrl: "",
+          waitingForCaption: "",
+          waitingForChannelSelection: "",
+          waitingForBroadcastMessage: "",
+          url: "",
+          caption: "",
+          selectedChannel: "",
+          channelName: ""
+        },
+        lastUpdated: new Date()
+      }
+    );
+    
+    logActivity(`Cleaned up state for user ${userId}`);
+  } catch (error) {
+    logError('Error cleaning up temp files:', error);
   }
-});
+}
 
-// Create a simple health check server
+// Set up a simple keepalive server if running on a hosting platform
 const server = http.createServer((req, res) => {
-  if (req.url === '/health') {
-    res.statusCode = 200;
-    res.setHeader('Content-Type', 'application/json');
-    res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
-  } else {
-    res.statusCode = 404;
-    res.end('Not found');
-  }
+  res.statusCode = 200;
+  res.setHeader('Content-Type', 'text/plain');
+  res.end('Bot server running\n');
 });
 
-// Start the server
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => {
-  console.log(`Health check server running on port ${PORT}`);
+server.listen(process.env.PORT || 3000, () => {
+  console.log(`Server running on port ${process.env.PORT || 3000}`);
 });
 
-// Set up graceful shutdown
-process.on('SIGINT', async () => {
-  console.log('Shutting down gracefully...');
+// Handle bot errors gracefully
+bot.catch((err, ctx) => {
+  logError('Global error handler caught:', err);
   
+  // Try to notify the user
   try {
-    // Close MongoDB connection
-    await mongoose.connection.close();
-    console.log('MongoDB connection closed');
-    
-    // Close HTTP server
-    server.close(() => {
-      console.log('HTTP server closed');
-      process.exit(0);
-    });
-  } catch (err) {
-    console.error('Error during shutdown:', err);
-    process.exit(1);
+    if (ctx && ctx.reply) {
+      ctx.reply('An error occurred while processing your request. The issue has been logged and will be investigated.');
+    }
+  } catch (replyErr) {
+    logError('Error in error handler:', replyErr);
   }
 });
 
-// Launch the bot
-console.log('Starting bot...');
+// Start the bot
 bot.launch()
   .then(() => {
     console.log('Bot started successfully');
@@ -921,8 +897,20 @@ bot.launch()
   })
   .catch(err => {
     console.error('Failed to start bot:', err);
+    logError('Bot startup failed:', err);
     process.exit(1);
   });
 
-// Export for testing
+// Enable graceful stop
+process.once('SIGINT', () => {
+  logActivity('Bot stopping due to SIGINT');
+  bot.stop('SIGINT');
+});
+
+process.once('SIGTERM', () => {
+  logActivity('Bot stopping due to SIGTERM');
+  bot.stop('SIGTERM');
+});
+
+// Export the bot instance for testing purposes
 module.exports = { bot };
