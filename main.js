@@ -341,7 +341,7 @@ bot.action(/resend_(.+)_(.+)/, adminCheckMiddleware, async (ctx) => {
     // Create inline keyboard with URL button and Request Video button
     const inlineKeyboard = Markup.inlineKeyboard([
       [Markup.button.url('Link mawas', post.url)],
-      [Markup.button.url('Request Video', 'https://t.me/diskwala_bot')]
+      [Markup.button.url('Request Video', 'https://t.me/teraseeubot')]
     ]);
     
     ctx.reply(`Resending post to ${channelName} channel...`);
