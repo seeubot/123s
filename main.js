@@ -338,13 +338,10 @@ bot.action(/resend_(.+)_(.+)/, adminCheckMiddleware, async (ctx) => {
     
     const channelId = CHANNELS[channelName];
     
-    // Create inline keyboard with URL button and join channel button
-    const joinButton = `Join ${channelName}`;
-    const channelUrl = `https://t.me/${channelId.replace('@', '')}`;
-    
+    // Create inline keyboard with URL button and Request Video button
     const inlineKeyboard = Markup.inlineKeyboard([
       [Markup.button.url('Link mawas', post.url)],
-      [Markup.button.url(joinButton, channelUrl)]
+      [Markup.button.url('Request Video', 'https://t.me/diskwala_bot')]
     ]);
     
     ctx.reply(`Resending post to ${channelName} channel...`);
@@ -688,13 +685,10 @@ async function postToChannel(ctx, userId) {
     const channelId = userState.selectedChannel;
     const channelName = userState.channelName;
     
-    // Create inline keyboard with URL button and join channel button
-    const joinButton = `Join ${channelName}`;
-    const channelUrl = `https://t.me/${channelId.replace('@', '')}`;
-    
+    // Create inline keyboard with URL button and Request Video button
     const inlineKeyboard = Markup.inlineKeyboard([
       [Markup.button.url('Link mawas', userState.url)],
-      [Markup.button.url(joinButton, channelUrl)]
+      [Markup.button.url('Request Video', 'https://t.me/diskwala_bot')]
     ]);
     
     // Verify thumbnail exists
@@ -819,8 +813,6 @@ async function cleanupTempFiles(userId) {
       }
     }
     
-    // Note: This is a continuation of the cleanupTempFiles function
-    
     // Don't delete selected thumbnail if it was saved to a post
     // Just check if the file exists first
     if (userState.selectedThumbnail && fs.existsSync(userState.selectedThumbnail)) {
@@ -828,132 +820,109 @@ async function cleanupTempFiles(userId) {
       
       if (!recentPost) {
         // If not used in a post, delete it
-        try {
-          fs.unlinkSync(userState.selectedThumbnail);
-          logActivity(`Deleted selected thumbnail: ${userState.selectedThumbnail}`);
-        } catch (err) {
-          logError(`Error deleting selected thumbnail file ${userState.selectedThumbnail}:`, err);
-        }
-      } else {
-        logActivity(`Kept thumbnail ${userState.selectedThumbnail} as it's used in post ${recentPost.postId}`);
-      }
+        // Continuing from the cleanupTempFiles function...
+    try {
+      fs.unlinkSync(userState.selectedThumbnail);
+      logActivity(`Deleted selected thumbnail: ${userState.selectedThumbnail}`);
+    } catch (err) {
+      logError(`Error deleting selected thumbnail file ${userState.selectedThumbnail}:`, err);
     }
-    
-    // Remove user state from database (or mark as completed)
-    await UserState.findOneAndDelete({ userId });
-    logActivity(`Cleaned up state for user ${userId}`);
-  } catch (error) {
-    logError(`Error during cleanup for user ${userId}:`, error);
   }
+    
+  // Reset user state
+  await UserState.findOneAndUpdate(
+    { userId },
+    {
+      $unset: {
+        sessionId: "",
+        videoId: "",
+        videoName: "",
+        videoWidth: "",
+        videoHeight: "",
+        aspectRatio: "",
+        duration: "",
+        thumbnails: "",
+        selectedThumbnail: "",
+        waitingForThumbnailSelection: "",
+        waitingForManualThumbnail: "",
+        waitingForUrl: "",
+        waitingForCaption: "",
+        url: "",
+        caption: "",
+        waitingForChannelSelection: "",
+        selectedChannel: "",
+        channelName: ""
+      },
+      lastUpdated: new Date()
+    }
+  );
+  
+  logActivity(`Cleaned up state for user ${userId}`);
+} catch (error) {
+  logError('Error cleaning up temp files:', error);
+}
 }
 
-// Create HTTP server for health checks
-const PORT = process.env.PORT || 8000;
-const server = http.createServer((req, res) => {
-  res.statusCode = 200;
-  res.setHeader('Content-Type', 'text/plain');
-  res.end('Bot is running!\n');
-});
-
-// Start the HTTP server first to ensure health checks pass
-console.log(`Starting HTTP server on port ${PORT}...`);
-server.listen(PORT, () => {
-  console.log(`HTTP server running on port ${PORT}`);
+// Global error handler middleware
+bot.catch((err, ctx) => {
+  logError('Global error:', err);
   
-  // Start the bot only after HTTP server is running
-  startBot();
+  try {
+    ctx.reply('An unexpected error occurred. Please try again or contact the administrator.');
+  } catch (replyError) {
+    logError('Error sending error message:', replyError);
+  }
 });
 
-// Handle errors in the HTTP server
-server.on('error', (err) => {
-  logError('HTTP server error:', err);
-  if (err.code === 'EADDRINUSE') {
-    console.error(`Port ${PORT} is already in use. The bot may already be running or another service is using this port.`);
-    console.log('Attempting to choose a different port...');
-    // Try a different port
-    server.close();
-    const newPort = PORT + 1;
-    console.log(`Trying port ${newPort}...`);
-    server.listen(newPort, () => {
-      console.log(`HTTP server now running on port ${newPort}`);
-      startBot();
-    });
+// Create a simple health check server
+const server = http.createServer((req, res) => {
+  if (req.url === '/health') {
+    res.statusCode = 200;
+    res.setHeader('Content-Type', 'application/json');
+    res.end(JSON.stringify({ status: 'ok', timestamp: new Date().toISOString() }));
   } else {
-    console.error('Fatal error with HTTP server. Exiting.');
+    res.statusCode = 404;
+    res.end('Not found');
+  }
+});
+
+// Start the server
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Health check server running on port ${PORT}`);
+});
+
+// Set up graceful shutdown
+process.on('SIGINT', async () => {
+  console.log('Shutting down gracefully...');
+  
+  try {
+    // Close MongoDB connection
+    await mongoose.connection.close();
+    console.log('MongoDB connection closed');
+    
+    // Close HTTP server
+    server.close(() => {
+      console.log('HTTP server closed');
+      process.exit(0);
+    });
+  } catch (err) {
+    console.error('Error during shutdown:', err);
     process.exit(1);
   }
 });
 
-// Handle bot errors
-bot.catch((err, ctx) => {
-  logError(`Bot error for ${ctx.updateType}:`, err);
-  // Try to notify user of error
-  try {
-    ctx.reply('Sorry, an error occurred processing your request. Please try again.');
-  } catch (replyErr) {
-    logError('Error sending error notification:', replyErr);
-  }
-});
+// Launch the bot
+console.log('Starting bot...');
+bot.launch()
+  .then(() => {
+    console.log('Bot started successfully');
+    logActivity('Bot started');
+  })
+  .catch(err => {
+    console.error('Failed to start bot:', err);
+    process.exit(1);
+  });
 
-// Separate function to start the bot
-function startBot() {
-  // Launch bot with retry mechanism
-  let launchAttempts = 0;
-  const maxAttempts = 5;
-
-  const attemptLaunch = async () => {
-    try {
-      console.log(`Attempt ${launchAttempts + 1} to launch bot...`);
-      await bot.launch();
-      console.log('Bot successfully launched!');
-      
-      // Add shutdown handlers
-      process.once('SIGINT', () => {
-        bot.stop('SIGINT');
-        server.close();
-        console.log('Bot stopped due to SIGINT');
-      });
-      process.once('SIGTERM', () => {
-        bot.stop('SIGTERM');
-        server.close();
-        console.log('Bot stopped due to SIGTERM');
-      });
-      
-    } catch (error) {
-      launchAttempts++;
-      logError(`Failed to launch bot (attempt ${launchAttempts}):`, error);
-      
-      if (launchAttempts < maxAttempts) {
-        const retryDelay = Math.pow(2, launchAttempts) * 1000; // Exponential backoff
-        console.log(`Retrying in ${retryDelay / 1000} seconds...`);
-        setTimeout(attemptLaunch, retryDelay);
-      } else {
-        console.error(`Failed to launch bot after ${maxAttempts} attempts. Giving up.`);
-        process.exit(1);
-      }
-    }
-  };
-
-  // Start the launch sequence
-  console.log('Starting Telegram thumbnail generator bot...');
-  attemptLaunch();
-}
-
-// Keep the process alive with improved error handling
-process.on('uncaughtException', (err) => {
-  logError('Uncaught exception:', err);
-  // Log but don't exit - try to keep running
-});
-
-process.on('unhandledRejection', (reason, promise) => {
-  logError('Unhandled Rejection at:', promise, 'reason:', reason);
-  // Log but don't exit - try to keep running
-});
-
-// Export modules for testing if needed
-module.exports = {
-  bot,
-  server,
-  thumbnailGenerator,
-  fallbackHandler
-};
+// Export for testing
+module.exports = { bot };
